@@ -1,0 +1,53 @@
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import gymnasium as gym
+import numpy as np
+
+from .ags import RegionizedAGSSwitcher
+from .controllers import PerfPolicy, QuantizedLQRBackup
+
+
+class CertifiedSwitcherController:
+    def __init__(self, perf: PerfPolicy, backup: QuantizedLQRBackup, ags: RegionizedAGSSwitcher, sigma: float, delta_budget_l2: float):
+        self.perf = perf
+        self.backup = backup
+        self.ags = ags
+        self.sigma = sigma
+        self.delta_budget_l2 = delta_budget_l2
+
+    def select(self, obs: np.ndarray) -> Tuple[int, Dict[str, float]]:
+        p1, p0, pA, pB, R_rs = self.ags.smoothed_prob_and_radius(obs, self.sigma)
+        R_reg = self.ags.region_radius(obs)
+        R_exec = min(R_rs, R_reg)
+        allow_perf = (p1 >= 0.5) and (R_exec >= self.delta_budget_l2)
+        action = self.perf.predict(obs) if allow_perf else self.backup.predict(obs)
+        return action, {
+            "p1": p1,
+            "p0": p0,
+            "pA": pA,
+            "pB": pB,
+            "R_rs": R_rs,
+            "R_reg": R_reg,
+            "R_exec": R_exec,
+            "allow_perf": float(allow_perf),
+        }
+
+
+def evaluate_controller(env_id: str, controller: CertifiedSwitcherController, episodes: int = 20, seed: int = 0):
+    env = gym.make(env_id)
+    returns: List[float] = []
+    logs: List[Dict[str, float]] = []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        total = 0.0
+        while not done:
+            action, info = controller.select(np.array(obs, dtype=np.float32))
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total += reward
+            logs.append(info)
+            done = terminated or truncated
+        returns.append(total)
+    env.close()
+    return returns, logs

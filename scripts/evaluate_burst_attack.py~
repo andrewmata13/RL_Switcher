@@ -1,0 +1,324 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import gymnasium as gym
+import numpy as np
+import torch
+
+from cartpole_ags_rs_switcher.ags import RegionizedAGSSwitcher
+from cartpole_ags_rs_switcher.attacks import fgsm_observation_attack
+from cartpole_ags_rs_switcher.controllers import PerfPolicy, QuantizedLQRBackup
+from cartpole_ags_rs_switcher.models import SwitcherMLP
+
+
+# ==========================================================
+# Controllers used for evaluation
+# ==========================================================
+
+class AlwaysPerfController:
+    def __init__(self, perf: PerfPolicy):
+        self.perf = perf
+
+    def select(self, obs: np.ndarray) -> Tuple[int, Dict[str, float]]:
+        return self.perf.predict(obs), {
+            "allow_perf": 1.0,
+            "p_critical": 0.0,
+            "p_allow": 1.0,
+            "R_rs": np.nan,
+            "R_reg": np.nan,
+            "R_exec": np.nan,
+        }
+
+
+class AlwaysBackupController:
+    def __init__(self, backup: QuantizedLQRBackup):
+        self.backup = backup
+
+    def select(self, obs: np.ndarray) -> Tuple[int, Dict[str, float]]:
+        return self.backup.predict(obs), {
+            "allow_perf": 0.0,
+            "p_critical": 1.0,
+            "p_allow": 0.0,
+            "R_rs": np.nan,
+            "R_reg": np.nan,
+            "R_exec": np.nan,
+        }
+
+
+class UncertifiedSwitcherController:
+    """Uses the learned switcher without the RS gate.
+
+    IMPORTANT: in this framework, p1 = P(critical), not P(allow perf).
+    """
+
+    def __init__(self, perf: PerfPolicy, backup: QuantizedLQRBackup, ags: RegionizedAGSSwitcher, sigma: float):
+        self.perf = perf
+        self.backup = backup
+        self.ags = ags
+        self.sigma = sigma
+
+    def select(self, obs: np.ndarray) -> Tuple[int, Dict[str, float]]:
+        p1, p0, pA, pB, R_rs = self.ags.smoothed_prob_and_radius(obs, self.sigma)
+        R_reg = self.ags.region_radius(obs)
+        # Here p1 = probability of CRITICAL, so allow perf if p1 < 0.5.
+        allow_perf = p1 < 0.5
+        action = self.perf.predict(obs) if allow_perf else self.backup.predict(obs)
+        return action, {
+            "allow_perf": float(allow_perf),
+            "p_critical": p1,
+            "p_allow": 1.0 - p1,
+            "pA": pA,
+            "pB": pB,
+            "R_rs": R_rs,
+            "R_reg": R_reg,
+            "R_exec": R_reg if np.isnan(R_rs) else min(R_rs, R_reg),
+        }
+
+
+class CertifiedSwitcherController:
+    """Uses the learned switcher with the RS gate.
+
+    IMPORTANT: in this framework, p1 = P(critical), not P(allow perf).
+    """
+
+    def __init__(self, perf: PerfPolicy, backup: QuantizedLQRBackup, ags: RegionizedAGSSwitcher, sigma: float, delta_budget_l2: float):
+        self.perf = perf
+        self.backup = backup
+        self.ags = ags
+        self.sigma = sigma
+        self.delta_budget_l2 = delta_budget_l2
+
+    def select(self, obs: np.ndarray) -> Tuple[int, Dict[str, float]]:
+        p1, p0, pA, pB, R_rs = self.ags.smoothed_prob_and_radius(obs, self.sigma)
+        R_reg = self.ags.region_radius(obs)
+        R_exec = min(R_rs, R_reg)
+        # p1 = P(critical), so allow perf if predicted non-critical AND certified.
+        allow_perf = (p1 < 0.5) and (R_exec >= self.delta_budget_l2)
+        action = self.perf.predict(obs) if allow_perf else self.backup.predict(obs)
+        return action, {
+            "allow_perf": float(allow_perf),
+            "p_critical": p1,
+            "p_allow": 1.0 - p1,
+            "pA": pA,
+            "pB": pB,
+            "R_rs": R_rs,
+            "R_reg": R_reg,
+            "R_exec": R_exec,
+        }
+
+
+# ==========================================================
+# Attack-aware rollout evaluation
+# ==========================================================
+
+@dataclass
+class AttackConfig:
+    epsilon_raw: np.ndarray
+    burst_k: int = 5
+    horizon_limit: int = 500
+    attack_mode: str = "none"      # one of {none, fixed, oracle}
+    burst_start: int = 25           # used when attack_mode == fixed
+
+
+def rollout_episode(
+    env_id: str,
+    controller,
+    perf_policy: PerfPolicy,
+    episode_seed: int,
+    attack_cfg: AttackConfig,
+    attack_start_override: Optional[int] = None,
+) -> Tuple[float, Dict[str, float]]:
+    env = gym.make(env_id)
+    obs, _ = env.reset(seed=episode_seed)
+    done = False
+    total_reward = 0.0
+    t = 0
+    infos: List[Dict[str, float]] = []
+
+    if attack_cfg.attack_mode == "none":
+        attack_start = None
+    elif attack_cfg.attack_mode == "fixed":
+        attack_start = attack_cfg.burst_start if attack_start_override is None else attack_start_override
+    elif attack_cfg.attack_mode == "oracle":
+        attack_start = attack_start_override
+    else:
+        raise ValueError(f"Unknown attack_mode={attack_cfg.attack_mode}")
+
+    while not done and t < attack_cfg.horizon_limit:
+        obs_for_controller = np.array(obs, dtype=np.float32).copy()
+
+        if attack_start is not None and attack_start <= t < attack_start + attack_cfg.burst_k:
+            # Threat model: attack crafted against perf policy, but corruption is applied
+            # to whatever controller is currently using the observation.
+            obs_for_controller = fgsm_observation_attack(perf_policy, obs_for_controller, attack_cfg.epsilon_raw)
+
+        action, info = controller.select(obs_for_controller)
+        obs, reward, terminated, truncated, _ = env.step(action)
+        total_reward += reward
+        infos.append(info)
+        done = terminated or truncated
+        t += 1
+
+    env.close()
+
+    agg = {
+        "return": total_reward,
+        "allow_perf_mean": float(np.mean([x["allow_perf"] for x in infos])) if infos else 0.0,
+        "p_critical_mean": float(np.mean([x["p_critical"] for x in infos])) if infos else np.nan,
+        "p_allow_mean": float(np.mean([x["p_allow"] for x in infos])) if infos else np.nan,
+        "R_rs_mean": float(np.nanmean([x["R_rs"] for x in infos])) if infos else np.nan,
+        "R_reg_mean": float(np.nanmean([x["R_reg"] for x in infos])) if infos else np.nan,
+        "R_exec_mean": float(np.nanmean([x["R_exec"] for x in infos])) if infos else np.nan,
+        "episode_len": len(infos),
+        "attack_start": -1 if attack_start is None else int(attack_start),
+    }
+    return total_reward, agg
+
+
+def evaluate_controller_under_attack(
+    env_id: str,
+    controller,
+    perf_policy: PerfPolicy,
+    episodes: int,
+    seed: int,
+    attack_cfg: AttackConfig,
+) -> Dict[str, float]:
+    returns: List[float] = []
+    allow_means: List[float] = []
+    pcrit_means: List[float] = []
+    pallow_means: List[float] = []
+    Rrs_means: List[float] = []
+    Rreg_means: List[float] = []
+    Rexec_means: List[float] = []
+    chosen_starts: List[int] = []
+
+    for ep in range(episodes):
+        episode_seed = seed + ep
+
+        if attack_cfg.attack_mode in ("none", "fixed"):
+            ret, agg = rollout_episode(env_id, controller, perf_policy, episode_seed, attack_cfg)
+        else:
+            # Oracle burst start: choose the start time that minimizes return.
+            # For CartPole this is cheap enough.
+            candidate_starts = list(range(0, attack_cfg.horizon_limit - attack_cfg.burst_k + 1, max(1, attack_cfg.burst_k)))
+            best_ret = None
+            best_agg = None
+            for start in candidate_starts:
+                ret_i, agg_i = rollout_episode(env_id, controller, perf_policy, episode_seed, attack_cfg, attack_start_override=start)
+                if best_ret is None or ret_i < best_ret:
+                    best_ret = ret_i
+                    best_agg = agg_i
+            ret, agg = best_ret, best_agg
+
+        returns.append(float(ret))
+        allow_means.append(agg["allow_perf_mean"])
+        pcrit_means.append(agg["p_critical_mean"])
+        pallow_means.append(agg["p_allow_mean"])
+        Rrs_means.append(agg["R_rs_mean"])
+        Rreg_means.append(agg["R_reg_mean"])
+        Rexec_means.append(agg["R_exec_mean"])
+        chosen_starts.append(int(agg["attack_start"]))
+
+    return {
+        "mean_return": float(np.mean(returns)),
+        "std_return": float(np.std(returns)),
+        "mean_allow_perf": float(np.mean(allow_means)),
+        "mean_p_critical": float(np.nanmean(pcrit_means)),
+        "mean_p_allow": float(np.nanmean(pallow_means)),
+        "mean_R_rs": float(np.nanmean(Rrs_means)),
+        "mean_R_reg": float(np.nanmean(Rreg_means)),
+        "mean_R_exec": float(np.nanmean(Rexec_means)),
+        "attack_start_mean": float(np.mean(chosen_starts)) if chosen_starts else -1.0,
+    }
+
+
+# ==========================================================
+# Script entry point
+# ==========================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate CartPole controllers under burst observation attacks.")
+    parser.add_argument("--perf-path", type=str, required=True)
+    parser.add_argument("--switcher-path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--env-id", type=str, default="CartPole-v1")
+    parser.add_argument("--episodes", type=int, default=25)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--bins-per-dim", type=int, default=2)
+    parser.add_argument("--sigma", type=float, default=0.8)
+    parser.add_argument("--delta-budget-l2", type=float, required=True)
+    parser.add_argument("--epsilon-norm", type=float, default=0.05, help="Per-dimension l_inf attack bound in normalized coordinates.")
+    parser.add_argument("--burst-k", type=int, default=5)
+    parser.add_argument("--attack-mode", type=str, default="oracle", choices=["none", "fixed", "oracle"])
+    parser.add_argument("--burst-start", type=int, default=25)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    perf = PerfPolicy.load(args.perf_path, device=device)
+    backup = QuantizedLQRBackup()
+
+    data = np.load(args.dataset)
+    X = data["X"]
+    mean = data["state_mean"]
+    std = data["state_std"]
+
+    ckpt = torch.load(args.switcher_path, map_location="cpu")
+    switcher = SwitcherMLP(obs_dim=int(ckpt["obs_dim"]), hidden_dim=int(ckpt["hidden_dim"]))
+    switcher.load_state_dict(ckpt["state_dict"])
+    switcher.eval()
+
+    ags = RegionizedAGSSwitcher(switcher, mean, std, bins_per_dim=args.bins_per_dim)
+    ags.fit(X)
+
+    epsilon_raw = np.full(shape=(X.shape[1],), fill_value=float(args.epsilon_norm), dtype=np.float32) * std.astype(np.float32)
+    attack_cfg = AttackConfig(
+        epsilon_raw=epsilon_raw,
+        burst_k=int(args.burst_k),
+        horizon_limit=500,
+        attack_mode=args.attack_mode,
+        burst_start=int(args.burst_start),
+    )
+
+    controllers = {
+        "always_perf": AlwaysPerfController(perf),
+        "always_backup": AlwaysBackupController(backup),
+        "uncertified_switcher": UncertifiedSwitcherController(perf, backup, ags, sigma=float(args.sigma)),
+        "certified_switcher": CertifiedSwitcherController(perf, backup, ags, sigma=float(args.sigma), delta_budget_l2=float(args.delta_budget_l2)),
+    }
+
+    print("=== Burst-attack evaluation ===")
+    print(f"env={args.env_id}")
+    print(f"episodes={args.episodes} seed={args.seed}")
+    print(f"attack_mode={args.attack_mode} burst_k={args.burst_k} burst_start={args.burst_start}")
+    print(f"epsilon_norm={args.epsilon_norm} delta_budget_l2={args.delta_budget_l2} sigma={args.sigma}")
+    print()
+
+    for name, controller in controllers.items():
+        metrics = evaluate_controller_under_attack(
+            env_id=args.env_id,
+            controller=controller,
+            perf_policy=perf,
+            episodes=args.episodes,
+            seed=args.seed,
+            attack_cfg=attack_cfg,
+        )
+        print(f"[{name}]")
+        print(f"  mean return      = {metrics['mean_return']:.2f}")
+        print(f"  std return       = {metrics['std_return']:.2f}")
+        print(f"  mean allow_perf  = {metrics['mean_allow_perf']:.3f}")
+        print(f"  mean p_critical  = {metrics['mean_p_critical']:.3f}")
+        print(f"  mean p_allow     = {metrics['mean_p_allow']:.3f}")
+        print(f"  mean R_rs        = {metrics['mean_R_rs']:.4f}")
+        print(f"  mean R_reg       = {metrics['mean_R_reg']:.4f}")
+        print(f"  mean R_exec      = {metrics['mean_R_exec']:.4f}")
+        print(f"  mean attack_start= {metrics['attack_start_mean']:.1f}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
