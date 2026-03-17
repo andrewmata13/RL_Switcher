@@ -7,7 +7,9 @@
       "Read(//home/andg/anaconda3/envs/**)",
       "Read(//home/andg/miniconda3/**)",
       "Bash(conda run:*)",
-      "Bash(python3.8 scripts/evaluate_burst_attack.py \\\\\n  --perf-path models/perf_cartpole_ppo \\\\\n  --switcher-path models/switcher.pt \\\\\n  --dataset data/critical_dataset.npz \\\\\n  --delta-budget-l2 0.2 \\\\\n  --attack-mode fixed \\\\\n  --episodes 20 2>&1)"
+      "Bash(python3.8 scripts/evaluate_burst_attack.py \\\\\n  --perf-path models/perf_cartpole_ppo \\\\\n  --switcher-path models/switcher.pt \\\\\n  --dataset data/critical_dataset.npz \\\\\n  --delta-budget-l2 0.2 \\\\\n  --attack-mode fixed \\\\\n  --episodes 20 2>&1)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
