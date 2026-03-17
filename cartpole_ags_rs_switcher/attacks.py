@@ -13,11 +13,20 @@ def pgd_l2_attack(
     n_steps: int = 10,
     alpha: float = None,
     n_restarts: int = 1,
+    targeted: bool = True,
 ) -> np.ndarray:
     """PGD L2 attack in normalized observation space.
 
     epsilon_l2 is the L2 budget in normalized space.
     Returns a perturbed observation in raw space.
+
+    When targeted=True (default), the attack maximizes the logit of the
+    action opposite to the clean action at this observation. This provides
+    directional coherence over a burst: every step is forced toward the
+    same wrong action, preventing the pole from self-correcting.
+
+    When targeted=False, the attack minimizes the top-2 logit margin
+    (untargeted — may flip to either action each step).
     """
     if alpha is None:
         alpha = min(0.25, 2.5 * epsilon_l2 / n_steps)
@@ -26,13 +35,28 @@ def pgd_l2_attack(
     std_t = torch.tensor(state_std.astype(np.float32), device=perf_policy.device)
     obs_norm = normalize(obs, state_mean, state_std).astype(np.float32)
 
+    # For targeted attack, fix the target as the action opposite to the clean prediction.
+    # This is computed once per call so every PGD step and restart shares the same target,
+    # giving physically coherent forcing across a burst window.
+    if targeted:
+        clean_action = perf_policy.predict(obs)
+        target_action = 1 - clean_action  # opposite of what PPO would choose
+
+    def _attack_loss(logits: torch.Tensor) -> torch.Tensor:
+        """Scalar loss to minimize: lower is a stronger attack."""
+        if targeted:
+            # Minimize logit[correct] - logit[target]: drives PPO to choose target_action
+            return logits[clean_action] - logits[target_action]
+        else:
+            top2 = torch.topk(logits, k=2)
+            return top2.values[0] - top2.values[1]
+
     def _margin(x_norm: np.ndarray) -> float:
         x_raw_t = torch.tensor(x_norm, dtype=torch.float32, device=perf_policy.device) * std_t + mean_t
         with torch.no_grad():
             dist = perf_policy.policy.get_distribution(x_raw_t.unsqueeze(0))
             logits = dist.distribution.logits.squeeze(0)
-            top2 = torch.topk(logits, k=2)
-        return float(top2.values[0] - top2.values[1])
+        return float(_attack_loss(logits))
 
     def _run_pgd(norm_start: np.ndarray) -> np.ndarray:
         adv_norm = norm_start.copy()
@@ -42,10 +66,9 @@ def pgd_l2_attack(
             obs_raw_t = adv_norm_t * std_t + mean_t
             dist = perf_policy.policy.get_distribution(obs_raw_t.unsqueeze(0))
             logits = dist.distribution.logits.squeeze(0)
-            top2 = torch.topk(logits, k=2)
-            margin = top2.values[0] - top2.values[1]
+            loss = _attack_loss(logits)
             perf_policy.policy.zero_grad(set_to_none=True)
-            margin.backward()
+            loss.backward()
 
             grad = adv_norm_t.grad.detach().cpu().numpy()
             grad_norm = np.linalg.norm(grad)

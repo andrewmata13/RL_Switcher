@@ -33,7 +33,7 @@ class CriticalBurstLabeler:
         for t in range(self.cfg.horizon_h):
             if attack_start is not None and attack_start <= t < attack_start + self.cfg.burst_k:
                 obs_used = pgd_l2_attack(self.perf_policy, obs, self.cfg.epsilon_l2,
-                                        self.state_mean, self.state_std, n_steps=self.cfg.pgd_steps)
+                                         self.state_mean, self.state_std, n_steps=self.cfg.pgd_steps)
             else:
                 obs_used = obs
             act = self.perf_policy.predict(obs_used)
