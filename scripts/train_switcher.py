@@ -7,7 +7,7 @@ import os
 import numpy as np
 import torch
 
-from cartpole_ags_rs_switcher.training import train_switcher
+from cartpole_rs_switcher.training import train_switcher
 
 
 def main():

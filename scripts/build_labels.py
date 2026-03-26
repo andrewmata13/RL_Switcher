@@ -8,9 +8,9 @@ import numpy as np
 import torch
 import gymnasium as gym
 
-from cartpole_ags_rs_switcher.config import LabelConfig
-from cartpole_ags_rs_switcher.controllers import PerfPolicy
-from cartpole_ags_rs_switcher.labeling import CriticalBurstLabeler
+from cartpole_rs_switcher.config import LabelConfig
+from cartpole_rs_switcher.controllers import PerfPolicy
+from cartpole_rs_switcher.labeling import CriticalBurstLabeler
 
 
 def collect_state_stats(perf_model, episodes: int = 30):

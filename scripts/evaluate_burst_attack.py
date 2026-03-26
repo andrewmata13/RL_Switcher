@@ -10,14 +10,14 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from cartpole_ags_rs_switcher.attacks import pgd_l2_attack
-from cartpole_ags_rs_switcher.controllers import PerfPolicy, QuantizedLQRBackup
-from cartpole_ags_rs_switcher.evaluation import (
+from cartpole_rs_switcher.attacks import pgd_l2_attack
+from cartpole_rs_switcher.controllers import PerfPolicy, QuantizedLQRBackup
+from cartpole_rs_switcher.evaluation import (
     AlwaysPerfController, AlwaysBackupController,
     UncertifiedSwitcherController, CertifiedSwitcherController,
 )
-from cartpole_ags_rs_switcher.models import SwitcherMLP
-from cartpole_ags_rs_switcher.rs import VanillaRSSwitcher
+from cartpole_rs_switcher.models import SwitcherMLP
+from cartpole_rs_switcher.rs import VanillaRSSwitcher
 
 
 # ==========================================================
