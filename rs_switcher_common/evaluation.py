@@ -16,6 +16,10 @@ Controllers:
       controller exits ATLA as soon as recovery_confirm_k consecutive
       certified-safe steps are observed, making it robust to varying attack
       lengths without knowing burst_k in advance.
+  ContinuousSwitcherController — hysteresis-based switching for arbitrary
+      attack models.  No permanent commit; loops between PPO and ATLA
+      indefinitely.  Uses asymmetric thresholds (K_enter, K_exit) to
+      control the false alarm / missed detection tradeoff.
 
 The evaluation loop drives the simulation via MuJoCoPerfPolicy.step() and
 computes ATLA-normalized obs from the raw sim state at each step.
@@ -338,7 +342,169 @@ class AdaptiveSwitcherController:
         }
 
 
+class ContinuousSwitcherController:
+    """
+    Hysteresis-based switcher for arbitrary (multi-burst) attack models.
+
+    No permanent PPO commit.  The controller loops between PPO and ATLA
+    indefinitely, using asymmetric entry/exit thresholds to balance false
+    alarm rate against detection latency.
+
+    State: PPO (monitoring)
+        RS-certify obs each step.
+        "not certified safe" = (pred != 0) OR (R < monitoring_delta).
+        Maintain alarm counter:
+            not safe -> alarm_count += 1
+            safe     -> alarm_count = max(0, alarm_count - forgive_decay)
+        alarm_count >= K_enter  ->  switch to ATLA, reset alarm_count.
+
+    State: ATLA (recovery)
+        RS-certify obs each step.
+        "certified safe" = (pred == 0) AND (R >= monitoring_delta).
+        Maintain safe counter:
+            safe     -> safe_count += 1
+            not safe -> safe_count = 0
+        safe_count >= K_exit  ->  switch to PPO.
+
+    Hysteresis property: K_enter > K_exit means it's hard to enter ATLA
+    (tolerates transient false alarms) but relatively easy to leave once
+    attack stops.  Conversely K_enter < K_exit means aggressive detection
+    but conservative recovery.  Tune to environment.
+
+    forgive_decay (default 1): how fast alarm_count decays when a safe step
+    is seen.  Higher values make detection harder to trigger from scattered
+    false alarms; the controller only enters ATLA on genuine bursts of
+    consecutive unsafe steps.
+    """
+
+    _PPO = "ppo"
+    _ATLA = "atla"
+
+    def __init__(self, perf: MuJoCoPerfPolicy, backup: MuJoCoBackupPolicy,
+                 rs: VanillaRSSwitcher,
+                 delta_budget_l2: float,
+                 K_enter: int = 3,
+                 K_exit: int = 10,
+                 monitoring_delta: float = None,
+                 forgive_decay: int = 1):
+        self.perf = perf
+        self.backup = backup
+        self.rs = rs
+        self.delta_budget_l2 = delta_budget_l2
+        self.monitoring_delta = delta_budget_l2 if monitoring_delta is None else monitoring_delta
+        self.K_enter = K_enter
+        self.K_exit = K_exit
+        self.forgive_decay = forgive_decay
+        self._reset()
+
+    def _reset(self):
+        self._state = self._PPO
+        self._alarm_count = 0
+        self._safe_count = 0
+
+    def reset_episode(self) -> None:
+        self._reset()
+
+    def select(self, obs_ppo: np.ndarray, obs_atla: np.ndarray
+               ) -> Tuple[np.ndarray, Dict]:
+
+        pred, p_A_lower, R = self.rs.certify(obs_ppo)
+        p_crit = (1.0 - p_A_lower) if pred == 0 else p_A_lower
+
+        if self._state == self._PPO:
+            certified_safe = (pred == 0) and (R >= self.monitoring_delta)
+
+            if not certified_safe:
+                self._alarm_count += 1
+            else:
+                self._alarm_count = max(0, self._alarm_count - self.forgive_decay)
+
+            if self._alarm_count >= self.K_enter:
+                # Enter ATLA
+                self._state = self._ATLA
+                self._alarm_count = 0
+                self._safe_count = 0
+                return self.backup.predict(obs_atla), {
+                    "allow_perf": 0.0, "p_critical": p_crit,
+                    "R_rs": R, "R_exec": float("nan"),
+                    "phase": "atla_enter",
+                }
+
+            return self.perf.predict(obs_ppo), {
+                "allow_perf": 1.0, "p_critical": p_crit,
+                "R_rs": R, "R_exec": float("nan"),
+                "phase": "ppo",
+            }
+
+        else:  # self._state == self._ATLA
+            certified_safe = (pred == 0) and (R >= self.monitoring_delta)
+
+            if certified_safe:
+                self._safe_count += 1
+            else:
+                self._safe_count = 0
+
+            if self._safe_count >= self.K_exit:
+                # Return to PPO
+                self._state = self._PPO
+                self._alarm_count = 0
+                self._safe_count = 0
+                return self.perf.predict(obs_ppo), {
+                    "allow_perf": 1.0, "p_critical": p_crit,
+                    "R_rs": R, "R_exec": R,
+                    "phase": "ppo_reenter",
+                }
+
+            return self.backup.predict(obs_atla), {
+                "allow_perf": 0.0, "p_critical": p_crit,
+                "R_rs": R, "R_exec": float("nan"),
+                "phase": "atla",
+            }
+
+
 # -- Evaluation loop -----------------------------------------------------------
+
+def _generate_attack_schedule(attack_mode, horizon, burst_k, t_candidate_max,
+                              t_candidate_fixed, rng,
+                              n_bursts=None, cooldown_k=0):
+    """
+    Return a boolean array of length `horizon` indicating which steps are
+    under attack.
+
+    attack_mode:
+      "single"    — one burst per episode (original behavior)
+      "multi"     — n_bursts bursts with at least cooldown_k gap between them
+      "arbitrary" — each step independently attacked with P(attack) tuned to
+                    give ~burst_k total attacked steps spread across episode
+    """
+    schedule = np.zeros(horizon, dtype=bool)
+
+    if attack_mode == "single":
+        T = (t_candidate_fixed if t_candidate_fixed is not None
+             else rng.randint(0, t_candidate_max + 1))
+        schedule[T:T + burst_k] = True
+
+    elif attack_mode == "multi":
+        n = n_bursts if n_bursts is not None else 3
+        placed = 0
+        t = 0
+        while placed < n and t < horizon:
+            # Random start within remaining episode
+            latest_start = horizon - burst_k
+            if t > latest_start:
+                break
+            T = rng.randint(t, min(t + t_candidate_max, latest_start) + 1)
+            schedule[T:T + burst_k] = True
+            t = T + burst_k + cooldown_k
+            placed += 1
+
+    elif attack_mode == "arbitrary":
+        # Bernoulli per step; expected total ≈ burst_k
+        p_attack = min(burst_k / max(horizon, 1), 1.0)
+        schedule = rng.random(horizon) < p_attack
+
+    return schedule
+
 
 def evaluate_controller(
     controller,
@@ -353,6 +519,9 @@ def evaluate_controller(
     attack_norm: str = "linf",
     attack_eps: float = None,
     t_candidate_fixed: int = None,
+    attack_mode: str = "single",
+    n_bursts: int = None,
+    cooldown_k: int = 0,
 ) -> Tuple[List[float], List[Dict]]:
     """
     Run n_episodes with the given controller.
@@ -360,11 +529,13 @@ def evaluate_controller(
     PPO's custom_env drives the simulation.  At each step, ATLA-normalized obs
     is computed from the raw sim state using ATLA's own read-only ZFilter.
 
-    Burst attack model: when attack=True, a single K-step adversarial burst is
-    injected once per episode.  If t_candidate_fixed is set, the burst always
-    starts at that step; otherwise T ~ U[0, t_candidate_max].
+    Attack modes (when attack=True):
+      "single"    — one burst per episode (original behavior)
+      "multi"     — n_bursts bursts of burst_k steps, cooldown_k gap between
+      "arbitrary" — each step independently attacked (Bernoulli, expected total
+                    ≈ burst_k steps)
     """
-    np.random.seed(seed)
+    rng = np.random.RandomState(seed)
     returns: List[float] = []
     logs: List[Dict] = []
 
@@ -377,24 +548,30 @@ def evaluate_controller(
         if hasattr(controller, "reset_episode"):
             controller.reset_episode()
 
-        T_candidate = t_candidate_fixed if t_candidate_fixed is not None else np.random.randint(0, t_candidate_max + 1)
-        burst_remaining = 0
+        # Pre-generate attack schedule for this episode
+        if attack:
+            atk_schedule = _generate_attack_schedule(
+                attack_mode, horizon, burst_k, t_candidate_max,
+                t_candidate_fixed, rng,
+                n_bursts=n_bursts, cooldown_k=cooldown_k,
+            )
+        else:
+            atk_schedule = np.zeros(horizon, dtype=bool)
+
+        total_attacked_steps = 0
 
         while not done and t < horizon:
             # ATLA obs from same raw sim state
             raw = raw_obs_from_sim(perf.custom_env, perf.config)
             obs_atla = backup.normalize(raw)
 
-            # Burst attack logic
+            # Attack logic
             obs_ctrl = obs_ppo
-            if attack and t == T_candidate:
-                burst_remaining = burst_k
-
-            if attack and burst_remaining > 0 and perf.attack_model is not None:
+            if atk_schedule[t] and perf.attack_model is not None:
                 eps = attack_eps if attack_eps is not None else perf.eps
                 obs_ctrl = opt_attack(perf.attack_model, obs_ppo, eps=eps,
                                       norm=attack_norm)
-                burst_remaining -= 1
+                total_attacked_steps += 1
 
             action, info = controller.select(obs_ctrl, obs_atla)
             obs_ppo, _, done, _ = perf.step(action)
@@ -412,6 +589,7 @@ def evaluate_controller(
         R_vals = [l["R_exec"] for l in step_logs if not np.isnan(l["R_exec"])]
         R_mean = float(np.nanmean(R_vals)) if R_vals else float("nan")
         logs.append({"allow_perf": allow_mean, "R_exec": R_mean,
-                      "fell": fell, "ep_len": t})
+                      "fell": fell, "ep_len": t,
+                      "attacked_steps": total_attacked_steps})
 
     return returns, logs

@@ -33,7 +33,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from rs_switcher_common.gp_models import SwitcherQuadMLP, SwitcherQuadDeepMLP
+from rs_switcher_common.gp_models import (
+    SwitcherQuadMLP, SwitcherQuadDeepMLP, SwitcherQuadSkipMLP,
+    SwitcherBottleneckMLP,
+)
 
 
 def margin_loss(logits, labels, kappa=2.0):
@@ -54,6 +57,8 @@ def train_gp_switcher(
     state_std: np.ndarray,
     hidden_dim: int = 64,
     backbone_dims: list = None,
+    skip_dim: int = 0,
+    arch: str = "quad",
     epochs: int = 500,
     lr: float = 1e-3,
     batch_size: int = 128,
@@ -74,7 +79,14 @@ def train_gp_switcher(
     ds = TensorDataset(X_raw, y_long)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-    if backbone_dims is not None:
+    if arch == "bottleneck":
+        model = SwitcherBottleneckMLP(obs_dim=X.shape[1],
+                                      hidden_dim=hidden_dim).to(device)
+    elif skip_dim > 0:
+        model = SwitcherQuadSkipMLP(obs_dim=X.shape[1],
+                                     quad_dim=hidden_dim,
+                                     skip_dim=skip_dim).to(device)
+    elif backbone_dims is not None:
         model = SwitcherQuadDeepMLP(obs_dim=X.shape[1],
                                      backbone_dims=backbone_dims).to(device)
     else:
@@ -140,6 +152,14 @@ def main():
                         help="Hidden dim for shallow SwitcherQuadMLP (ignored if --backbone-dims)")
     parser.add_argument("--backbone-dims", type=int, nargs="+", default=None,
                         help="Stacked Linear+BN dims for deep model (e.g. 128 256 256)")
+    parser.add_argument("--skip-dim",     type=int, default=0,
+                        help="Linear skip pathway dimension (0=disabled). "
+                             "Uses SwitcherQuadSkipMLP: quad_dim=hidden-dim, skip_dim=this.")
+    parser.add_argument("--arch",         type=str, default="quad",
+                        choices=["quad", "bottleneck"],
+                        help="Architecture: 'quad'=x²+x (default), "
+                             "'bottleneck'=Linear(obs,k)->ReLU->Linear(k,2) "
+                             "certified via k-dim Gauss-Hermite quadrature")
     parser.add_argument("--epochs",        type=int, default=500)
     parser.add_argument("--sigma",         type=float, default=0.1)
     parser.add_argument("--lr",            type=float, default=1e-3)
@@ -156,7 +176,15 @@ def main():
 
     print(f"Dataset: {len(X)} samples, obs_dim={X.shape[1]}, "
           f"critical fraction = {y.mean():.3f}")
-    if args.backbone_dims:
+    if args.arch == "bottleneck":
+        print(f"Training bottleneck GP switcher: k={args.hidden_dim}, "
+              f"epochs={args.epochs}, sigma={args.sigma}, "
+              f"lambda_margin={args.lambda_margin}, kappa={args.kappa}")
+    elif args.skip_dim > 0:
+        print(f"Training quad+skip GP switcher: quad_dim={args.hidden_dim}, "
+              f"skip_dim={args.skip_dim}, epochs={args.epochs}, sigma={args.sigma}, "
+              f"lambda_margin={args.lambda_margin}, kappa={args.kappa}")
+    elif args.backbone_dims:
         print(f"Training deep GP switcher: backbone_dims={args.backbone_dims}, "
               f"epochs={args.epochs}, sigma={args.sigma}, "
               f"lambda_margin={args.lambda_margin}, kappa={args.kappa}")
@@ -170,6 +198,8 @@ def main():
         X, y, mean, std,
         hidden_dim=args.hidden_dim,
         backbone_dims=args.backbone_dims,
+        skip_dim=args.skip_dim,
+        arch=args.arch,
         epochs=args.epochs,
         sigma=args.sigma,
         lr=args.lr,
@@ -192,7 +222,14 @@ def main():
     print(f"Parameters: {n_params:,}")
 
     ck = {"state_dict": model.state_dict(), "obs_dim": X.shape[1]}
-    if args.backbone_dims:
+    if args.arch == "bottleneck":
+        ck["model_type"] = "bottleneck"
+        ck["hidden_dim"] = args.hidden_dim
+    elif args.skip_dim > 0:
+        ck["model_type"] = "quad_skip"
+        ck["quad_dim"] = args.hidden_dim
+        ck["skip_dim"] = args.skip_dim
+    elif args.backbone_dims:
         ck["backbone_dims"] = args.backbone_dims
         ck["model_type"] = "quad_deep"
     else:

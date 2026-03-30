@@ -540,23 +540,27 @@ class Trainer():
 
                     perturbation = ch.nn.functional.hardtanh(next_adv_perturbations)
 
-                    # Code to use perturbation as max of L-infinity noise
-                    bounds = self.environment.bounds
-                   
-                    upper = torch.tensor([])
-                    lower = torch.tensor([])
-                    for i in range(len(bounds)):
-                        if i in self.environment.mask:
-                            upper = torch.cat((upper, torch.tensor([0])))
-                            lower = torch.cat((lower, torch.tensor([0])))
-                        else:
-                            r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
-                            upper = torch.cat((upper, torch.tensor([r])))
-                            lower = torch.cat((lower, torch.tensor([-r])))
+                    adv_norm = getattr(self.params, 'ADV_NORM', 'linf')
+                    if adv_norm == 'l2':
+                        # L2 projection: normalize direction, scale by eps
+                        p_norm = perturbation.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+                        perturbation = perturbation / p_norm * float(self.ADV_EPS)
+                    else:
+                        # L-inf: per-dimension bounds
+                        bounds = self.environment.bounds
+                        upper = torch.tensor([])
+                        lower = torch.tensor([])
+                        for i in range(len(bounds)):
+                            if i in self.environment.mask:
+                                upper = torch.cat((upper, torch.tensor([0])))
+                                lower = torch.cat((lower, torch.tensor([0])))
+                            else:
+                                r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
+                                upper = torch.cat((upper, torch.tensor([r])))
+                                lower = torch.cat((lower, torch.tensor([-r])))
+                        perturbation = torch.minimum(upper, perturbation)
+                        perturbation = torch.maximum(lower, perturbation)
 
-                    perturbation = torch.minimum(upper, perturbation)
-                    perturbation = torch.maximum(lower, perturbation)
-                    
                     last_states = last_states + perturbation
                     
                     # the perturbation itself is the action (similar to the next_actions variable below)
@@ -683,25 +687,27 @@ class Trainer():
                 next_adv_perturbations = self.adversary_policy_model.sample(adv_perturbation_pds)
                 # add the perturbation to state (we learn a residual).
 
-                perturbation = ch.nn.funtional.hardtanh(next_adv_perturbations)
-                
-                # Code to use perturbation as max of L-infinity noise
-                bounds = self.environment.bounds
-                   
-                upper = torch.tensor([])
-                lower = torch.tensor([])
-                for i in range(len(bounds)):
-                    if i in self.environment.mask:
-                        upper = torch.cat((upper, torch.tensor([0])))
-                        lower = torch.cat((lower, torch.tensor([0])))
-                    else:
-                        r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
-                        upper = torch.cat((upper, torch.tensor([r])))
-                        lower = torch.cat((lower, torch.tensor([-r])))
+                perturbation = ch.nn.functional.hardtanh(next_adv_perturbations)
 
-                perturbation = torch.minimum(upper, perturbation)
-                perturbation = torch.maximum(lower, perturbation)
-                   
+                adv_norm = getattr(self.params, 'ADV_NORM', 'linf')
+                if adv_norm == 'l2':
+                    p_norm = perturbation.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+                    perturbation = perturbation / p_norm * float(self.ADV_EPS)
+                else:
+                    bounds = self.environment.bounds
+                    upper = torch.tensor([])
+                    lower = torch.tensor([])
+                    for i in range(len(bounds)):
+                        if i in self.environment.mask:
+                            upper = torch.cat((upper, torch.tensor([0])))
+                            lower = torch.cat((lower, torch.tensor([0])))
+                        else:
+                            r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
+                            upper = torch.cat((upper, torch.tensor([r])))
+                            lower = torch.cat((lower, torch.tensor([-r])))
+                    perturbation = torch.minimum(upper, perturbation)
+                    perturbation = torch.maximum(lower, perturbation)
+
                 last_states = last_states + perturbation
             else:
                 last_states = self.apply_attack(last_states)
@@ -917,23 +923,25 @@ class Trainer():
             
             perturbation = ch.nn.functional.hardtanh(perturbations_mean)
 
-            # Code to use perturbation as max of L-infinity noise
-            bounds = self.environment.bounds
-            
-            upper = torch.tensor([])
-            lower = torch.tensor([])
-            for i in range(len(bounds)):
-                if i in self.environment.mask:
-                    upper = torch.cat((upper, torch.tensor([0])))
-                    lower = torch.cat((lower, torch.tensor([0])))
-                else:
-                    r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
-                    upper = torch.cat((upper, torch.tensor([r])))
-                    lower = torch.cat((lower, torch.tensor([-r])))
+            adv_norm = getattr(self.params, 'ADV_NORM', 'linf')
+            if adv_norm == 'l2':
+                p_norm = perturbation.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+                perturbation = perturbation / p_norm * float(self.ADV_EPS)
+            else:
+                bounds = self.environment.bounds
+                upper = torch.tensor([])
+                lower = torch.tensor([])
+                for i in range(len(bounds)):
+                    if i in self.environment.mask:
+                        upper = torch.cat((upper, torch.tensor([0])))
+                        lower = torch.cat((lower, torch.tensor([0])))
+                    else:
+                        r = (bounds[i][1] - bounds[i][0]) * self.ADV_EPS
+                        upper = torch.cat((upper, torch.tensor([r])))
+                        lower = torch.cat((lower, torch.tensor([-r])))
+                perturbation = torch.minimum(upper, perturbation)
+                perturbation = torch.maximum(lower, perturbation)
 
-            perturbation = torch.minimum(upper, perturbation)
-            perturbation = torch.maximum(lower, perturbation)
-                   
             perturbed_states = last_states + perturbation
 
             """

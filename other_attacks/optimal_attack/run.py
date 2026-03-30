@@ -297,6 +297,8 @@ def add_common_parser_opts(parser):
     parser.add_argument('--adv-policy-steps', type=float, help='number of policy steps before adversary steps')
     parser.add_argument('--adv-adversary-steps', type=float, help='number of adversary steps before adversary steps')
     parser.add_argument('--adv-adversary-ratio', type=float, help='percentage of frames to attack for the adversary')
+    parser.add_argument('--adv-norm', type=str, default='linf', choices=['linf', 'l2'],
+                        help='norm constraint for adversary perturbations (linf or l2)')
 
     # Adversarial attack parameters.
     parser.add_argument('--attack-method', type=str, choices=["none", "critic", "random", "action", "sarsa", "sarsa+action", "advpolicy", "action+imit"], help='adversarial attack methods.')

@@ -5,6 +5,7 @@
     "adv_clip_eps": "same",
     "adv_entropy_coeff": "same",
     "adv_eps": "same",
+    "adv_norm": "linf",
     "adv_policy_steps": 1,
     "adv_ppo_lr_adam": "same",
     "adv_val_lr": "same",

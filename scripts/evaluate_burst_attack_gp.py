@@ -43,7 +43,7 @@ from rs_switcher_common.evaluation import (
 )
 from rs_switcher_common.models import SwitcherMLP, SwitcherDeepMLP
 from rs_switcher_common.rs import VanillaRSSwitcher
-from rs_switcher_common.gp_models import SwitcherQuadMLP, SwitcherQuadDeepMLP, GPSwitcher
+from rs_switcher_common.gp_models import load_gp_switcher, GPSwitcher
 
 
 def run(controller, perf, backup, episodes, seed, attacked, burst_k, t_candidate_max,
@@ -127,14 +127,7 @@ def main():
 
     # Load GP switcher
     gp_ck = torch.load(args.gp_switcher_path, map_location="cpu")
-    if gp_ck.get("model_type") == "quad_deep":
-        gp_model = SwitcherQuadDeepMLP(obs_dim=int(gp_ck["obs_dim"]),
-                                        backbone_dims=gp_ck["backbone_dims"])
-    else:
-        gp_model = SwitcherQuadMLP(obs_dim=int(gp_ck["obs_dim"]),
-                                    hidden_dim=int(gp_ck["hidden_dim"]))
-    gp_model.load_state_dict(gp_ck["state_dict"])
-    gp_model.eval()
+    gp_model = load_gp_switcher(gp_ck)
     gp_cert = GPSwitcher(gp_model, mean, std, sigma=args.sigma, device="cpu")
 
     # Build controllers

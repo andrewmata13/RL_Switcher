@@ -36,7 +36,7 @@ from rs_switcher_common.evaluation import (
     AnyTimeSwitcherController, AdaptiveSwitcherController,
     evaluate_controller,
 )
-from rs_switcher_common.models import SwitcherMLP, SwitcherDeepMLP
+from rs_switcher_common.models import load_switcher
 from rs_switcher_common.rs import VanillaRSSwitcher
 
 
@@ -115,14 +115,7 @@ def main():
     mean, std = data["state_mean"], data["state_std"]
 
     ckpt = torch.load(args.switcher_path, map_location="cpu")
-    if "hidden_dims" in ckpt:
-        switcher = SwitcherDeepMLP(obs_dim=int(ckpt["obs_dim"]),
-                                    hidden_dims=ckpt["hidden_dims"])
-    else:
-        switcher = SwitcherMLP(obs_dim=int(ckpt["obs_dim"]),
-                                hidden_dim=int(ckpt["hidden_dim"]))
-    switcher.load_state_dict(ckpt["state_dict"])
-    switcher.eval()
+    switcher = load_switcher(ckpt)
 
     rs = VanillaRSSwitcher(switcher, mean, std,
                            sigma=args.sigma,
