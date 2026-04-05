@@ -25,6 +25,7 @@ The evaluation loop drives the simulation via MuJoCoPerfPolicy.step() and
 computes ATLA-normalized obs from the raw sim state at each step.
 """
 from typing import Dict, List, Tuple
+import collections
 import numpy as np
 
 from .controllers import MuJoCoPerfPolicy, MuJoCoBackupPolicy, raw_obs_from_sim
@@ -94,7 +95,8 @@ class AnyTimeSwitcherController:
                  detection_k: int = 2,
                  recovery_k: int = 100,
                  commit_timeout_k: int = 5,
-                 monitoring_delta: float = None):
+                 monitoring_delta: float = None,
+                 commit_steps: int = None):
         self.perf = perf
         self.backup = backup
         self.rs = rs
@@ -106,6 +108,9 @@ class AnyTimeSwitcherController:
         self.detection_k = detection_k
         self.recovery_k = recovery_k
         self.commit_timeout_k = commit_timeout_k
+        # commit_steps: if set, Phase 4 lasts this many steps then loops back
+        # to Phase 1 monitoring. If None, Phase 4 is permanent (single-burst).
+        self.commit_steps = commit_steps
         self._reset()
 
     def _reset(self):
@@ -113,6 +118,7 @@ class AnyTimeSwitcherController:
         self._consec_unsafe = 0
         self._recovery_remaining = 0
         self._commit_steps = 0
+        self._commit_timer = 0
 
     def reset_episode(self) -> None:
         self._reset()
@@ -122,6 +128,13 @@ class AnyTimeSwitcherController:
 
         # -- Phase 4: committed PPO (no more RS calls) ------------------------
         if self._phase == self._COMMITTED:
+            if self.commit_steps is not None:
+                self._commit_timer += 1
+                if self._commit_timer >= self.commit_steps:
+                    # Finite commit: loop back to Phase 1 monitoring
+                    self._phase = self._PPO
+                    self._consec_unsafe = 0
+                    self._commit_timer = 0
             return self.perf.predict(obs_ppo), {
                 "allow_perf": 1.0, "p_critical": 0.0,
                 "R_rs": float("nan"), "R_exec": float("nan"),
@@ -240,7 +253,8 @@ class AdaptiveSwitcherController:
                  detection_k: int = 2,
                  recovery_confirm_k: int = 25,
                  commit_timeout_k: int = 5,
-                 monitoring_delta: float = None):
+                 monitoring_delta: float = None,
+                 commit_steps: int = None):
         self.perf = perf
         self.backup = backup
         self.rs = rs
@@ -249,6 +263,9 @@ class AdaptiveSwitcherController:
         self.detection_k = detection_k
         self.recovery_confirm_k = recovery_confirm_k
         self.commit_timeout_k = commit_timeout_k
+        # commit_steps: if set, committed PPO lasts this many steps then loops
+        # back to Phase 1. If None, commit is permanent (original behaviour).
+        self.commit_steps = commit_steps
         self._reset()
 
     def _reset(self):
@@ -256,6 +273,7 @@ class AdaptiveSwitcherController:
         self._consec_unsafe = 0
         self._consec_safe_in_recovery = 0
         self._commit_steps = 0
+        self._commit_timer = 0
 
     def reset_episode(self) -> None:
         self._reset()
@@ -263,8 +281,14 @@ class AdaptiveSwitcherController:
     def select(self, obs_ppo: np.ndarray, obs_atla: np.ndarray
                ) -> Tuple[np.ndarray, Dict]:
 
-        # -- Phase 4: committed PPO (no more RS calls) ------------------------
+        # -- Phase 4: committed PPO (no RS calls) --------------------------------
         if self._phase == self._COMMITTED:
+            self._commit_timer += 1
+            if self.commit_steps is not None and self._commit_timer >= self.commit_steps:
+                # Finite commit: loop back to Phase 1 monitoring
+                self._phase = self._PPO
+                self._consec_unsafe = 0
+                self._commit_timer = 0
             return self.perf.predict(obs_ppo), {
                 "allow_perf": 1.0, "p_critical": 0.0,
                 "R_rs": float("nan"), "R_exec": float("nan"),
@@ -386,7 +410,11 @@ class ContinuousSwitcherController:
                  K_enter: int = 3,
                  K_exit: int = 10,
                  monitoring_delta: float = None,
-                 forgive_decay: int = 1):
+                 forgive_decay: float = 1.0,
+                 exit_window_n: int = None,
+                 atla_min_steps: int = 0,
+                 ppo_settle_steps: int = 0,
+                 transition_blend_k: int = 0):
         self.perf = perf
         self.backup = backup
         self.rs = rs
@@ -395,12 +423,29 @@ class ContinuousSwitcherController:
         self.K_enter = K_enter
         self.K_exit = K_exit
         self.forgive_decay = forgive_decay
+        # exit_window_n: if set, exit ATLA when K_exit out of last exit_window_n
+        # steps are certified safe (sliding window). If None, use consecutive count.
+        self.exit_window_n = exit_window_n
+        # atla_min_steps: minimum steps to stay in ATLA before checking exit condition.
+        # Covers the full burst duration before allowing cert-based exit. 0 = no minimum.
+        self.atla_min_steps = atla_min_steps
+        # ppo_settle_steps: steps after returning from ATLA where alarm counting is
+        # suppressed. Prevents immediate re-trigger from post-ATLA transitional
+        # states that look adversarial. 0 = no settling period.
+        self.ppo_settle_steps = ppo_settle_steps
+        # transition_blend_k: after exiting ATLA, linearly blend ATLA→PPO actions
+        # over this many steps (alpha=t/K from 0→1). Helps smooth gait mismatch.
+        self.transition_blend_k = transition_blend_k
         self._reset()
 
     def _reset(self):
         self._state = self._PPO
-        self._alarm_count = 0
+        self._alarm_count = 0.0
         self._safe_count = 0
+        self._atla_step_count = 0
+        self._ppo_settle_remaining = 0
+        self._blend_remaining = 0
+        self._exit_window = collections.deque(maxlen=self.exit_window_n) if self.exit_window_n else None
 
     def reset_episode(self) -> None:
         self._reset()
@@ -414,20 +459,38 @@ class ContinuousSwitcherController:
         if self._state == self._PPO:
             certified_safe = (pred == 0) and (R >= self.monitoring_delta)
 
-            if not certified_safe:
+            if self._ppo_settle_remaining > 0:
+                # Settling period after ATLA: suppress alarm counting
+                self._ppo_settle_remaining -= 1
+            elif not certified_safe:
                 self._alarm_count += 1
             else:
-                self._alarm_count = max(0, self._alarm_count - self.forgive_decay)
+                self._alarm_count = max(0.0, self._alarm_count - self.forgive_decay)
 
             if self._alarm_count >= self.K_enter:
                 # Enter ATLA
                 self._state = self._ATLA
-                self._alarm_count = 0
+                self._alarm_count = 0.0
                 self._safe_count = 0
+                self._atla_step_count = 0
+                self._blend_remaining = 0
                 return self.backup.predict(obs_atla), {
                     "allow_perf": 0.0, "p_critical": p_crit,
                     "R_rs": R, "R_exec": float("nan"),
                     "phase": "atla_enter",
+                }
+
+            # Blend ATLA→PPO actions during transition window
+            if self._blend_remaining > 0:
+                alpha = float(self.transition_blend_k - self._blend_remaining + 1) / self.transition_blend_k
+                ppo_action  = self.perf.predict(obs_ppo)
+                atla_action = self.backup.predict(obs_atla)
+                action = (1.0 - alpha) * atla_action + alpha * ppo_action
+                self._blend_remaining -= 1
+                return action, {
+                    "allow_perf": alpha, "p_critical": p_crit,
+                    "R_rs": R, "R_exec": float("nan"),
+                    "phase": "blend",
                 }
 
             return self.perf.predict(obs_ppo), {
@@ -438,22 +501,54 @@ class ContinuousSwitcherController:
 
         else:  # self._state == self._ATLA
             certified_safe = (pred == 0) and (R >= self.monitoring_delta)
+            self._atla_step_count += 1
 
-            if certified_safe:
-                self._safe_count += 1
-            else:
-                self._safe_count = 0
-
-            if self._safe_count >= self.K_exit:
-                # Return to PPO
-                self._state = self._PPO
-                self._alarm_count = 0
-                self._safe_count = 0
-                return self.perf.predict(obs_ppo), {
-                    "allow_perf": 1.0, "p_critical": p_crit,
-                    "R_rs": R, "R_exec": R,
-                    "phase": "ppo_reenter",
+            # Only evaluate exit condition after minimum ATLA steps
+            if self._atla_step_count < self.atla_min_steps:
+                return self.backup.predict(obs_atla), {
+                    "allow_perf": 0.0, "p_critical": p_crit,
+                    "R_rs": R, "R_exec": float("nan"),
+                    "phase": "atla_min",
                 }
+
+            if self._exit_window is not None:
+                self._exit_window.append(int(certified_safe))
+                exit_condition = (len(self._exit_window) == self.exit_window_n
+                                  and sum(self._exit_window) >= self.K_exit)
+            else:
+                if certified_safe:
+                    self._safe_count += 1
+                else:
+                    self._safe_count = 0
+                exit_condition = self._safe_count >= self.K_exit
+
+            if exit_condition:
+                    # Return to PPO with optional blend and settle period
+                    self._state = self._PPO
+                    self._alarm_count = 0.0
+                    self._safe_count = 0
+                    # Settle timer starts AFTER blend completes
+                    self._ppo_settle_remaining = self.ppo_settle_steps
+                    self._blend_remaining = self.transition_blend_k
+                    if self._exit_window is not None:
+                        self._exit_window.clear()
+                    if self.transition_blend_k > 0:
+                        # First blend step: alpha=1/K
+                        alpha = 1.0 / self.transition_blend_k
+                        ppo_action  = self.perf.predict(obs_ppo)
+                        atla_action = self.backup.predict(obs_atla)
+                        action = (1.0 - alpha) * atla_action + alpha * ppo_action
+                        self._blend_remaining -= 1
+                        return action, {
+                            "allow_perf": alpha, "p_critical": p_crit,
+                            "R_rs": R, "R_exec": R,
+                            "phase": "blend",
+                        }
+                    return self.perf.predict(obs_ppo), {
+                        "allow_perf": 1.0, "p_critical": p_crit,
+                        "R_rs": R, "R_exec": R,
+                        "phase": "ppo_reenter",
+                    }
 
             return self.backup.predict(obs_atla), {
                 "allow_perf": 0.0, "p_critical": p_crit,

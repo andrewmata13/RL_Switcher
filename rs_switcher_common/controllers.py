@@ -22,10 +22,13 @@ def raw_obs_from_sim(custom_env, config: EnvConfig) -> np.ndarray:
     Extract raw observation from the MuJoCo simulator state.
 
     Reads qpos and qvel slices according to config, optionally clips qvel.
+    Supports both old gym 0.26 (.sim.data) and new gymnasium v4 (.data) APIs.
     """
     inner = custom_env.env.unwrapped
-    qpos = np.array(inner.sim.data.qpos.flat[config.qpos_slice[0]:config.qpos_slice[1]])
-    qvel = np.array(inner.sim.data.qvel.flat[config.qvel_slice[0]:config.qvel_slice[1]])
+    # gymnasium v4: inner.data; old MuJoCo via gym 0.26: inner.sim.data
+    mj_data = getattr(inner, "data", None) or inner.sim.data
+    qpos = np.array(mj_data.qpos.flat[config.qpos_slice[0]:config.qpos_slice[1]])
+    qvel = np.array(mj_data.qvel.flat[config.qvel_slice[0]:config.qvel_slice[1]])
     if config.qvel_clip is not None:
         qvel = np.clip(qvel, -config.qvel_clip, config.qvel_clip)
     return np.concatenate([qpos, qvel]).astype(np.float32)

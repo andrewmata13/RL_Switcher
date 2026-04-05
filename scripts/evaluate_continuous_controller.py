@@ -37,10 +37,11 @@ import torch
 
 from rs_switcher_common.env_config import ENV_REGISTRY
 from rs_switcher_common.controllers import MuJoCoPerfPolicy, MuJoCoBackupPolicy
+from rs_switcher_common.clean_policies import CleanPerfPolicy, CleanBackupPolicy, PPOAsBackup, DegradedPPOBackup
 from rs_switcher_common.evaluation import (
     AlwaysPerfController, AlwaysBackupController,
-    AdaptiveSwitcherController, ContinuousSwitcherController,
-    evaluate_controller,
+    AnyTimeSwitcherController, AdaptiveSwitcherController,
+    ContinuousSwitcherController, evaluate_controller,
 )
 from rs_switcher_common.gp_models import load_gp_switcher, GPSwitcher
 from rs_switcher_common.models import load_switcher
@@ -76,7 +77,8 @@ def main():
     p.add_argument("--env", required=True, choices=list(ENV_REGISTRY.keys()))
     p.add_argument("--perf-path", required=True)
     p.add_argument("--attack-path", required=True)
-    p.add_argument("--backup-path", required=True)
+    p.add_argument("--backup-path", default=None,
+                   help="ATLA backup checkpoint. Not required when --ppo-as-backup is set.")
     p.add_argument("--gp-switcher-path", default=None)
     p.add_argument("--rs-switcher-path", default=None,
                    help="RS switcher checkpoint (SwitcherRobustMLP/DeepMLP/MLP). "
@@ -103,20 +105,59 @@ def main():
     p.add_argument("--detection-k", type=int, default=2)
     p.add_argument("--recovery-confirm-k", type=int, default=10)
     p.add_argument("--commit-timeout-k", type=int, default=5)
+    p.add_argument("--commit-steps", type=int, default=None,
+                   help="Finite committed-PPO duration; loops back to Phase 1. None = permanent.")
     p.add_argument("--monitoring-delta", type=float, default=None)
+
+    # AnyTime controller params
+    p.add_argument("--recovery-k", type=int, default=100,
+                   help="Fixed ATLA recovery window for AnyTimeSwitcherController")
 
     # Continuous controller params
     p.add_argument("--K-enter", type=int, default=3)
     p.add_argument("--K-exit", type=int, default=10)
-    p.add_argument("--forgive-decay", type=int, default=1)
+    p.add_argument("--forgive-decay", type=float, default=1.0)
+    p.add_argument("--exit-window-n", type=int, default=None,
+                   help="Sliding-window exit: exit ATLA when K-exit out of last N steps are safe")
+    p.add_argument("--atla-min-steps", type=int, default=0,
+                   help="Minimum steps to stay in ATLA before cert-based exit is checked")
+    p.add_argument("--ppo-settle-steps", type=int, default=0,
+                   help="Steps after ATLA->PPO transition where alarm counting is suppressed")
+    p.add_argument("--transition-blend-k", type=int, default=0,
+                   help="Steps to linearly blend ATLA->PPO actions after exiting ATLA")
 
     p.add_argument("--output-json", type=str, default=None)
+    p.add_argument("--clean", action="store_true",
+                   help="Use clean pipeline (CleanPerfPolicy / CleanBackupPolicy) "
+                        "instead of ZFilter-based policies. --perf-path must be the "
+                        "clean PPO checkpoint; --attack-path the adversary checkpoint.")
+    p.add_argument("--ppo-as-backup", action="store_true",
+                   help="Use PPO itself as the backup (PPOAsBackup). Requires --clean. "
+                        "Attack is neutralized because backup always sees clean simulator "
+                        "state. Gives 0%% transition fall rate.")
+    p.add_argument("--backup-action-noise", type=float, default=None,
+                   help="Use DegradedPPOBackup: PPO + Gaussian action noise at inference. "
+                        "Requires --clean. Degrades backup return while preserving gait "
+                        "compatibility and 0%% transition fall rate.")
     args = p.parse_args()
 
+    if not args.ppo_as_backup and args.backup_action_noise is None and args.backup_path is None:
+        p.error("--backup-path is required unless --ppo-as-backup or --backup-action-noise is set")
+
     config = ENV_REGISTRY[args.env]
-    perf = MuJoCoPerfPolicy.load(config, args.perf_path,
-                                  attack_path=args.attack_path)
-    backup = MuJoCoBackupPolicy.load(config, args.backup_path)
+    if args.clean:
+        perf   = CleanPerfPolicy.load(config, args.perf_path,
+                                      attack_path=args.attack_path)
+        if args.ppo_as_backup:
+            backup = PPOAsBackup(perf)
+        elif args.backup_action_noise is not None:
+            backup = DegradedPPOBackup(perf, action_noise_sigma=args.backup_action_noise)
+        else:
+            backup = CleanBackupPolicy.load(config, args.backup_path)
+    else:
+        perf   = MuJoCoPerfPolicy.load(config, args.perf_path,
+                                       attack_path=args.attack_path)
+        backup = MuJoCoBackupPolicy.load(config, args.backup_path)
 
     data = np.load(args.dataset)
     mean, std = data["state_mean"], data["state_std"]
@@ -139,27 +180,40 @@ def main():
     controllers = {
         "always_perf":          AlwaysPerfController(perf),
         "always_backup":        AlwaysBackupController(backup),
+        f"anytime_{cert_label}": AnyTimeSwitcherController(
+                                    perf, backup, cert,
+                                    delta_budget_l2=args.delta_budget_l2,
+                                    detection_k=args.detection_k,
+                                    recovery_k=args.recovery_k,
+                                    commit_timeout_k=args.commit_timeout_k,
+                                    monitoring_delta=args.monitoring_delta,
+                                    commit_steps=args.commit_steps),
         f"adaptive_{cert_label}": AdaptiveSwitcherController(
                                     perf, backup, cert,
                                     delta_budget_l2=args.delta_budget_l2,
                                     detection_k=args.detection_k,
                                     recovery_confirm_k=args.recovery_confirm_k,
                                     commit_timeout_k=args.commit_timeout_k,
-                                    monitoring_delta=args.monitoring_delta),
+                                    monitoring_delta=args.monitoring_delta,
+                                    commit_steps=args.commit_steps),
         f"continuous_{cert_label}": ContinuousSwitcherController(
                                     perf, backup, cert,
                                     delta_budget_l2=args.delta_budget_l2,
                                     K_enter=args.K_enter,
                                     K_exit=args.K_exit,
                                     monitoring_delta=args.monitoring_delta,
-                                    forgive_decay=args.forgive_decay),
+                                    forgive_decay=args.forgive_decay,
+                                    exit_window_n=args.exit_window_n,
+                                    atla_min_steps=args.atla_min_steps,
+                                    ppo_settle_steps=args.ppo_settle_steps,
+                                    transition_blend_k=args.transition_blend_k),
     }
 
     print(f"=== {config.name} Continuous Controller Evaluation ===")
     print(f"attack_mode={args.attack_mode}  burst_k={args.burst_k}  "
           f"n_bursts={args.n_bursts}  cooldown_k={args.cooldown_k}")
     print(f"K_enter={args.K_enter}  K_exit={args.K_exit}  "
-          f"forgive_decay={args.forgive_decay}")
+          f"forgive_decay={args.forgive_decay}  exit_window_n={args.exit_window_n}")
     print(f"sigma={args.sigma}  delta={args.delta_budget_l2}  "
           f"attack_norm={args.attack_norm}  attack_eps={args.attack_eps}")
     print(f"episodes={args.episodes}  seed={args.seed}")

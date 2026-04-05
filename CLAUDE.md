@@ -367,6 +367,161 @@ python3.8 scripts/evaluate_worst_case_start.py --env hopper \
 | `recovery_confirm_k` | 10 | Adaptive exit from ATLA |
 | `commit_timeout_k` | 5 | Max steps in commit check before forced PPO |
 
+### Hopper (Clean Pipeline — ZFilter-Free)
+
+A second Hopper pipeline eliminates ZFilter normalization entirely, replacing it with a single frozen mean/std computed once from clean rollouts (Welford online estimator during PPO training). Both PPO and ATLA share these frozen stats, eliminating all ZFilter switching instability.
+
+**Key design decisions**:
+- `train_clean_ppo.py` trains PPO with `RunningNorm` (frozen after training); saves `{policy_model, norm_mean, norm_std}`
+- `build_clean_dataset.py` stores **normalized** obs (not raw): `obs_ppo = (raw - norm_mean) / norm_std`; `state_mean/state_std ≈ 0/1` so `GPSwitcher._normalize_t` is a near no-op
+- Dataset MUST use PPO-only trajectories (not ATLA). Adding ATLA obs degrades accuracy or causes mode collapse.
+
+**Critical bug found and fixed**: Original `data/hopper_clean_dataset.npz` stored RAW obs with raw-space stats (mean[0]≈1.30, Hopper height). At inference, GPSwitcher received already-normalized obs (≈0) and computed (0-1.30)/0.17=-7.6 — completely OOD → 100% wrong predictions → 19-20/20 falls.
+
+**Artifacts**:
+- PPO: `Hopper/Hopper_Clean_PPO.pt` (frozen norm stats embedded)
+- ATLA: `Hopper/Hopper_Clean_ATLA.pt`
+- Adversary: `Hopper/Hopper_Clean_PPO_Adv.pt` (separate adversary checkpoint)
+- Dataset: `data/hopper_clean_ppoonly.npz` (12000 samples, PPO-only, state_mean≈0, state_std≈1)
+- GP model: `models/hopper_clean_gp.pt` (sigma=0.1, 87.9% accuracy, hidden_dim=512)
+
+**Evaluation** (use `--clean` flag): `scripts/evaluate_continuous_controller.py --clean --perf-path Hopper/Hopper_Clean_PPO.pt --attack-path Hopper/Hopper_Clean_PPO_Adv.pt --backup-path Hopper/Hopper_Clean_ATLA.pt`
+
+**Results (100 episodes, seeds 0-4, L2 attack eps=0.13, burst_k=75, dk=10, rck=10, ctk=5):**
+
+| Controller | Clean return | Clean falls | Attacked return | Attacked falls |
+|---|:---:|:---:|:---:|:---:|
+| Always PPO | 3572 ± 9 | 0% | 1486 ± 1166 | **78%** |
+| Always ATLA | 3458 ± 26 | 0% | 3427 ± 316 | 1% |
+| **Adaptive GP** | **3480 ± 172** | **4%** | **3250 ± 702** | **15%** |
+
+Results saved to `results/hopper_clean_multiseed.json`.
+
+**Key findings from clean pipeline**:
+- Per-step cert fail rate (pred=1 OR R<0.075) on clean PPO: **59.5%**, not 12.9%. The R<0.075 condition filters 46.6% of steps that have pred=0 but small certified radius.
+- Phase 1 dk=10 triggers: ~18.8 per 1000 steps (run lengths: mean=7.1, 22.4% of runs ≥10 steps long). Frequent false alarm entries into Phase 2.
+- Phase 2 exits QUICKLY (~17 steps) on false alarm entries because the state is still near PPO trajectory — cert safe rate near-PPO is much higher than 41.9% ATLA average.
+- False alarms help attacked performance: pre-attack Phase 4 commit puts controller in permanent PPO before the attack starts, partially protecting early attack exposure.
+- Optimal: `monitoring_delta=None` (=0.075), `detection_k=10`, `recovery_confirm_k=10`, `commit_timeout_k=5`. Smaller monitoring_delta removes the beneficial false alarm mechanism, worsening attacked performance.
+
+**Continuous controller broken for Hopper with ATLA v1 backup — SOLVED with PPOAsBackup**:
+
+Root cause (ATLA v1): ATLA v1 has a slightly different gait period. After ~100 steps of ATLA from a mid-episode PPO state, the robot is ~180° out of phase with what PPO expects. Transition at "danger zone" episode steps (e.g., 150, 220) caused 40-57% fall rates.
+
+**Fix: `PPOAsBackup`** (`rs_switcher_common/clean_policies.py`): uses the PPO policy itself as the backup.
+- Key insight: `obs_atla = raw_obs_from_sim()` always provides clean (unperturbed) simulator state. The adversary only perturbs `obs_ppo`, never `obs_atla`.
+- PPO on clean obs produces correct PPO actions → same gait → 0% transition fall rate at ANY episode timing.
+- Attack neutralized: even during attack, backup (PPO on clean obs) gives correct actions.
+- **Limitation**: backup ≈ PPO → always_backup ≈ always_perf → no reward gap → switcher value appears only in falls, not reward. Use HalfCheetah for reward-based comparison.
+
+Also available: `DegradedPPOBackup` (PPO + Gaussian action noise at inference, `--backup-action-noise sigma`). Tested but collapses Hopper at sigma=0.1 (16/20 falls). Not useful for Hopper; might work for more forgiving environments.
+
+**Use `--ppo-as-backup` flag** with `--clean` in `evaluate_continuous_controller.py`. Backup path not required.
+
+**Dataset**: `data/hopper_clean_v1_l2eps02.npz` (24000 samples, includes ATLA v1 recovery states as y=0)
+**Switcher**: `models/hopper_clean_robust_v1_l2eps02.pt` (RobustMLP [1024,1024,512,512,256], sigma=0.1, 98.3% accuracy)
+**Cert params**: `sigma_cert=0.05`, `delta=0.05`, `n_samples=500` → 84% of clean PPO steps certify
+
+**ContinuousSwitcherController results (PPOAsBackup, RS certifier, seed=0, 30 episodes, L2 eps=0.13, K_enter=2, K_exit=5):**
+
+| Attack mode | Controller | Return | Falls |
+|---|:---:|:---:|:---:|
+| Single burst (75 steps) | always_perf | 1761 | 22/30 |
+| Single burst (75 steps) | **continuous_rs** | **3569** | **0/30** |
+| Multi (3×75 burst/75 gap) | always_perf | 1161 | 28/30 |
+| Multi (3×75 burst/75 gap) | **continuous_rs** | **3481** | **4/30** |
+| Arbitrary (Bernoulli ~75 steps) | always_perf | 3475 | 2/30 |
+| Arbitrary (Bernoulli ~75 steps) | **continuous_rs** | **3570** | **0/30** |
+
+```bash
+# Evaluate ContinuousSwitcherController with PPO-as-backup
+python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
+    --perf-path Hopper/Hopper_Clean_PPO.pt \
+    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
+    --ppo-as-backup \
+    --rs-switcher-path models/hopper_clean_robust_v1_l2eps02.pt \
+    --dataset data/hopper_clean_v1_l2eps02.npz \
+    --sigma 0.05 --delta-budget-l2 0.05 --n-samples 500 \
+    --episodes 30 --seed 0 \
+    --attack-mode multi --n-bursts 3 --burst-k 75 --cooldown-k 75 \
+    --K-enter 2 --K-exit 5 --forgive-decay 1.0 \
+    --attack-norm l2 --attack-eps 0.13 \
+    --output-json results/hopper_ppo_backup_multi.json
+```
+
+**Build commands**:
+```bash
+# Train clean PPO
+python3.8 scripts/train_clean_ppo.py --env hopper \
+    --output Hopper/Hopper_Clean_PPO.pt --total-steps 1000000 --seed 0
+
+# Build dataset (PPO-only normalized obs)
+python3.8 scripts/build_clean_dataset.py --env hopper \
+    --ppo-path Hopper/Hopper_Clean_PPO.pt \
+    --adv-path Hopper/Hopper_Clean_PPO_Adv.pt \
+    --backup-path Hopper/Hopper_Clean_ATLA.pt \
+    --dataset-out data/hopper_clean_ppoonly.npz \
+    --episodes 30 --subsample-every 5
+
+# Train GP switcher
+python3.8 scripts/train_switcher_gp.py \
+    --dataset data/hopper_clean_ppoonly.npz \
+    --output models/hopper_clean_gp.pt \
+    --hidden-dim 512 --epochs 500 --sigma 0.1
+
+# Evaluate adaptive controller
+python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
+    --perf-path Hopper/Hopper_Clean_PPO.pt \
+    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
+    --backup-path Hopper/Hopper_Clean_ATLA.pt \
+    --gp-switcher-path models/hopper_clean_gp.pt \
+    --dataset data/hopper_clean_ppoonly.npz \
+    --sigma 0.1 --delta-budget-l2 0.075 \
+    --episodes 30 --seed 0 \
+    --attack-mode single --burst-k 75 --t-candidate-max 100 \
+    --detection-k 10 --recovery-confirm-k 10 --commit-timeout-k 5 \
+    --attack-norm l2 --attack-eps 0.13
+```
+
+**Hopper backup constraint — why reward-based continuous controller story doesn't work for Hopper:**
+
+Any backup with a different policy than PPO (e.g., ATLA) has a different gait period. After N steps of ATLA from a mid-episode PPO state, the robot is out of phase. ATLA→PPO transitions at danger-zone episode steps (e.g., 150, 220) cause 40–67% fall rates. This makes the continuous controller unreliable regardless of K_enter/K_exit tuning.
+
+Attempts to make the backup weaker while preserving gait compatibility all failed:
+- Obs-noise training (sigma=0.01–0.10): policy collapses to 400 return / 20/20 falls (Hopper needs sub-1% obs precision)
+- Action-noise inference (sigma=0.1): 16/20 falls (needs precise torques)
+- Short PPO training (600k steps): return unstable (~1900–3200), not a reliable weaker backup
+
+| Backup approach | Weaker than PPO? | Gait-compatible? | Result |
+|---|:---:|:---:|:---:|
+| ATLA backup | Yes (3453 vs 3574, −3.3%) | No | 15–30/30 transition falls |
+| Obs-noise training | No | Collapses | 20/20 falls during training |
+| Action-noise inference | No | Collapses | 16/20 falls at sigma=0.1 |
+| PPOAsBackup | No (3572 ≈ 3574) | Yes — 0/30 falls | No reward gap |
+
+**Conclusion**: For the continuous controller reward story, use HalfCheetah (ATLA 22% weaker, no falls). For Hopper, use the adaptive 4-phase controller with ATLA backup for single-burst attacks (GP certifier, dk=10, rck=10):
+
+| Controller | Clean | Single-burst attacked | PPO% clean | PPO% attacked |
+|---|:---:|:---:|:---:|:---:|
+| always_perf | 3495 | 1697 | 100% | 100% |
+| always_backup | 3458 | 3454 | 0% | 0% |
+| **adaptive_gp** | **3441** | **3317** | **96.5%** | **94.5%** |
+
+```bash
+# Adaptive controller for Hopper (single burst)
+python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
+    --perf-path Hopper/Hopper_Clean_PPO.pt \
+    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
+    --backup-path Hopper/Hopper_Clean_ATLA.pt \
+    --gp-switcher-path models/hopper_clean_gp.pt \
+    --dataset data/hopper_clean_ppoonly.npz \
+    --sigma 0.1 --delta-budget-l2 0.075 --episodes 30 --seed 0 \
+    --attack-mode single --burst-k 75 --t-candidate-max 100 \
+    --detection-k 10 --recovery-confirm-k 10 --commit-timeout-k 5 \
+    --attack-norm l2 --attack-eps 0.13 \
+    --output-json results/hopper_adaptive_single.json
+```
+
 ### HalfCheetah
 
 - `obs_dim=17`, `action_dim=6`, `eps=0.15` (L-inf), `name="Cheetah"`
@@ -393,31 +548,55 @@ python3.8 scripts/evaluate_worst_case_start.py --env hopper \
 | `detection_k` | 5 |
 | `recovery_confirm_k` | 3 |
 
-**Continuous RS results (seed 0, 10 episodes, L2 attack eps=0.50, multi-burst 3×100 with cooldown=100):**
+**ContinuousSwitcherController results (GP switcher, seed 0, 10 episodes, L2 eps=0.50):**
 
-| Controller | Clean return | Attacked return | PPO% clean | PPO% attacked |
+Attack configs: multi = 3×100 burst/100 cooldown; arbitrary = 30% Bernoulli; bursty = 30% attack, min-5-step bursts.
+
+| Controller | Clean return | Multi atk | Arbitrary 30% | Bursty min-5 |
 |---|:---:|:---:|:---:|:---:|
-| Always PPO | 7287 +/- 94 | 2525 +/- 1477 | 100% | 100% |
-| Always ATLA | 5625 +/- 30 | 5659 +/- 40 | 0% | 0% |
-| Adaptive RS | 5818 +/- 343 | 5672 +/- 158 | 11.4% | 6.1% |
-| **Continuous RS** | **7170 +/- 94** | **6421 +/- 119** | **96.8%** | **56.7%** |
+| Always PPO | ~7200 | ~2000-3600 | ~5000-5800 | ~4700 |
+| Always ATLA | ~5640 | ~5640 | ~5620 | ~5630 |
+| **OLD K3/K5/fd1.0** | **7128 (94%PPO)** | **6582±116** | 5295±1450 | 5044±1520 |
+| K4/K10/fd1.0 | 7001 (85%PPO) | 5680±85 | 5584±110 | 5647±54 |
+| **K3/K5/am100/fd1.0** | **~6700 (70-77%PPO)** | **6405±173** | **5792±128** | **5605±287** |
 
-Key: HalfCheetah is ideal for ContinuousSwitcherController — never terminates, so repeated ATLA periods cause degradation not falls. At sigma=0.10/delta=0.10, 99.5% of clean steps certify (0.5% false alarm rate), enabling K_enter=3, K_exit=5 without excessive ATLA time.
+**Recommended design: `K_enter=3, K_exit=5, atla_min_steps=100, forgive_decay=1.0`**
+
+Key insight: `atla_min_steps=100` is the right mechanism for all-attack robustness:
+- Prevents premature ATLA exit during short-gap attacks (5-step bursty, 30% random)
+- `K_exit=5` still allows quick exit after minimum stay, exploiting 100-step multi-burst cooldowns
+- `K_enter=3` detects attacks fast (3 consecutive cert fails → ATLA)
+- `fd=1.0` keeps false alarm rate low (no accumulation of scattered clean-step fails)
+
+Why OLD (K3/K5/fd1.0) fails for bursty/arbitrary: K_exit=5 exits ATLA after ~16 steps; burst gaps are only ~12 steps → controller oscillates between PPO and ATLA during ongoing attack, causing massive variance.
+Why K4/K10/fd1.0 fails for multi-burst: K_exit=10 needs ~115 steps to exit; 100-step cooldown is too short → never exploits clean periods between bursts → return ≈ always_backup.
+Why am100 works: forced 100-step minimum ATLA stay covers full burst duration; K_exit=5 then exits in ~17 steps during clean cooldown/post-attack gaps.
+
+**Actual cert fail rate on HalfCheetah clean rollouts: ~14% (NOT 5.5% as measured on training data)**. The training dataset distribution is slightly different from runtime PPO rollout distribution. This means simple simulations overestimate clean PPO% by ~20-30%.
+
+**Fresh 30-episode results (seed=0, GP switcher, K_enter=3, K_exit=5, atla_min=100, L2 eps=0.5):**
+
+| Controller | Clean return | Single burst | Multi burst (3×100/100) | Arbitrary | PPO% clean |
+|---|:---:|:---:|:---:|:---:|:---:|
+| always_perf | 7207 | 5734 | 3248 | 7050 | 100% |
+| always_backup | 5637 | 5633 | 5631 | 5637 | 0% |
+| **continuous_gp** | **6810** | **6645** | **6082** | **6245** | **74%** |
+
+PPO% under attack: single=65%, multi=50%, arbitrary=50%. Backup is 22% weaker than PPO on clean (5637 vs 7207), making HalfCheetah the primary environment for the reward-based continuous controller story.
 
 ```bash
-# Evaluate continuous RS controller on HalfCheetah
+# Evaluate continuous GP controller on HalfCheetah (recommended am100 design)
 python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \
     --perf-path HalfCheetah/HalfCheetah_PPO.model \
     --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \
     --backup-path HalfCheetah/HalfCheetah_ATLA.model \
-    --rs-switcher-path models/halfcheetah_switcher_robust.pt \
+    --gp-switcher-path models/halfcheetah_switcher_gp_s02.pt \
     --dataset data/halfcheetah_critical_dataset.npz \
-    --sigma 0.1 --delta-budget-l2 0.1 \
-    --n-samples 300 --episodes 10 --seed 0 \
+    --sigma 0.2 --delta-budget-l2 0.1 --episodes 30 --seed 0 \
     --attack-mode multi --n-bursts 3 --burst-k 100 --cooldown-k 100 \
-    --K-enter 3 --K-exit 5 \
+    --K-enter 3 --K-exit 5 --forgive-decay 1.0 --atla-min-steps 100 \
     --attack-norm l2 --attack-eps 0.5 \
-    --output-json results/halfcheetah_continuous_rs.json
+    --output-json results/halfcheetah_cont_multi.json
 ```
 
 ### Walker2D

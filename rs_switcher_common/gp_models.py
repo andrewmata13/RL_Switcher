@@ -288,6 +288,153 @@ def certify_bottleneck_pA(model, x_norm, sigma, predicted_class=None, n_quad=16)
     return float(np.clip(pA, 0.0, 1.0))
 
 
+def _smolyak_gauss_hermite_grid(k: int, level: int, _cache: dict = {}) -> tuple:
+    """
+    Smolyak sparse grid for k-dimensional N(0, I) integration.
+
+    Replaces tensor-product Gauss-Hermite (n^k points) with O(k^level) points,
+    enabling certification of large bottleneck models (k=16, 32) at ~2-5ms.
+
+    1D rule at Smolyak level l uses n = 2l-1 Gauss-Hermite points scaled to N(0,1).
+    The Smolyak combination formula uses signed coefficients; weights may be negative
+    but sum to 1 for any constant function.
+
+    level:
+        2 → exact for total-degree-3 polynomials,  ~k^2     points
+        3 → exact for total-degree-5 polynomials,  ~k^3/6   points  (recommended)
+        4 → exact for total-degree-7 polynomials,  ~k^4/24  points
+
+    Approximate point counts (k=16, k=32):
+        level=3:  ~20k pts (k=16),  ~150k pts (k=32)
+        level=4: ~120k pts (k=16), ~1.5M  pts (k=32)
+
+    Grid is cached by (k, level) — computed once, reused across certify() calls.
+    """
+    cache_key = (k, level)
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    from math import comb
+
+    _1d_rules: dict = {}
+
+    def _get_1d_rule(l: int):
+        if l not in _1d_rules:
+            n = 2 * l - 1
+            pts_raw, wts_raw = np.polynomial.hermite.hermgauss(n)
+            _1d_rules[l] = (np.sqrt(2) * pts_raw, wts_raw / np.sqrt(np.pi))
+        return _1d_rules[l]
+
+    all_pts: list = []
+    all_wts: list = []
+
+    # Enumerate all k-tuples beta with beta_i >= 0 and |beta| <= level.
+    # Smolyak coefficient: c = (-1)^(level-s) * C(k-1, level-s), s = sum(beta).
+    def _enum_beta(remaining: int, dim: int, current: list):
+        if dim == k:
+            yield tuple(current)
+            return
+        for v in range(min(remaining, level) + 1):
+            current.append(v)
+            yield from _enum_beta(remaining - v, dim + 1, current)
+            current.pop()
+
+    for beta in _enum_beta(level, 0, []):
+        s = sum(beta)
+        coeff = ((-1) ** (level - s)) * comb(k - 1, level - s)
+        if coeff == 0:
+            continue
+
+        active = [i for i, b in enumerate(beta) if b > 0]
+
+        if not active:
+            pts_block = np.zeros((1, k))
+            wts_block = np.ones(1)
+        else:
+            pts_1d = [_get_1d_rule(beta[i] + 1)[0] for i in active]
+            wts_1d = [_get_1d_rule(beta[i] + 1)[1] for i in active]
+
+            # Tensor product over ACTIVE dimensions only (len(active) <= level << k)
+            grids_p = np.meshgrid(*pts_1d, indexing='ij')
+            grids_w = np.meshgrid(*wts_1d, indexing='ij')
+            n_pts = int(np.prod([len(p) for p in pts_1d]))
+
+            pts_active = np.stack([g.ravel() for g in grids_p], axis=1)  # (n, |S|)
+            wts_block = np.ones(n_pts)
+            for gw in grids_w:
+                wts_block *= gw.ravel()
+
+            # Embed active-dim coordinates in full k-dim space (zero elsewhere)
+            pts_block = np.zeros((n_pts, k))
+            pts_block[:, active] = pts_active
+
+        all_pts.append(pts_block)
+        all_wts.append(coeff * wts_block)
+
+    points = np.concatenate(all_pts, axis=0)   # (N, k)
+    weights = np.concatenate(all_wts, axis=0)  # (N,) signed
+
+    _cache[cache_key] = (points, weights)
+    return points, weights
+
+
+def certify_bottleneck_sparse_pA(
+    model,
+    x_norm: torch.Tensor,
+    sigma: float,
+    predicted_class: int = None,
+    level: int = 3,
+) -> float:
+    """
+    Approximate p_A for SwitcherBottleneckMLP via Smolyak sparse Gauss-Hermite.
+
+    Supports large bottleneck (k=16, 32) intractable with certify_bottleneck_pA.
+    Point count is O(k^level) vs O(n^k) for tensor product.
+
+    Args:
+        model          : SwitcherBottleneckMLP
+        x_norm         : normalized observation, shape [obs_dim]
+        sigma          : smoothing noise std
+        predicted_class: override prediction (default: argmax of logits)
+        level          : Smolyak accuracy level (3 recommended for k<=32)
+
+    Returns:
+        p_A: float in [0, 1]
+    """
+    W1 = model.linear1.weight.detach().cpu().numpy().astype(np.float64)
+    b1 = model.linear1.bias.detach().cpu().numpy().astype(np.float64)
+    W2 = model.linear2.weight.detach().cpu().numpy().astype(np.float64)
+    b2 = model.linear2.bias.detach().cpu().numpy().astype(np.float64)
+    x_np = x_norm.detach().cpu().numpy().astype(np.float64)
+
+    k = model.hidden_dim
+    a = W1 @ x_np + b1                              # (k,) pre-activation mean
+    G = (sigma ** 2) * (W1 @ W1.T)                  # (k, k) pre-activation covariance
+    L = np.linalg.cholesky(G + 1e-12 * np.eye(k))   # Cholesky: G = L L^T
+
+    with torch.no_grad():
+        logits = model(x_norm.unsqueeze(0)).squeeze(0)
+    A = predicted_class if predicted_class is not None else int(logits.argmax().item())
+    j_cls = 1 - A
+
+    u = (W2[A] - W2[j_cls]).astype(np.float64)  # (k,) margin coefficients
+    d_val = float(b2[A] - b2[j_cls])
+
+    mu_margin = float(np.dot(u, np.maximum(a, 0.0)) + d_val)
+    if mu_margin <= 0:
+        return 0.0
+
+    # Sparse grid for N(0, I_k); cached after first call
+    z_pts, z_wts = _smolyak_gauss_hermite_grid(k, level)  # (N, k), (N,)
+
+    # Transform noise to pre-activation space: h = L z + a
+    h_flat = z_pts @ L.T + a[None, :]              # (N, k)
+    M_flat = np.maximum(h_flat, 0.0) @ u + d_val   # (N,)
+
+    pA = float(np.sum(z_wts[M_flat > 0]))
+    return float(np.clip(pA, 0.0, 1.0))
+
+
 def certify_quad_skip_pA(model, x_norm, sigma, predicted_class=None):
     """
     Exact p_A for SwitcherQuadSkipMLP via Gil-Pelaez inversion.
@@ -395,6 +542,7 @@ class GPSwitcher:
         sigma: float,
         device: str = "cpu",
         n_quad: int = None,
+        sparse_level: int = 3,
     ):
         self.device = torch.device(device)
         self.model = model.eval().to(self.device)
@@ -403,18 +551,40 @@ class GPSwitcher:
         self.sigma = sigma
         self._is_skip = isinstance(model, SwitcherQuadSkipMLP)
         self._is_bottleneck = isinstance(model, SwitcherBottleneckMLP)
+        self._sparse_level = sparse_level
 
-        # Auto-select n_quad for bottleneck: target ~200MB memory and <8ms
-        # z_flat is n^k × k float64 = n^k * k * 8 bytes; cap at 200MB => n^k < 25M/k
-        if self._is_bottleneck and n_quad is None:
+        # For bottleneck: auto-select tensor product (small k) vs sparse grid (large k).
+        # Tensor product: n^k points, fast for k<=6 with n<=16 but intractable for k>8.
+        # Sparse grid:    O(k^sparse_level) points, tractable for k=16 or k=32.
+        if self._is_bottleneck:
             k = model.hidden_dim
-            for n in [16, 12, 10, 8, 6, 5, 4]:
-                if n ** k * k * 8 < 200_000_000:
-                    n_quad = n
-                    break
+            if n_quad is not None:
+                # Explicit tensor-product order requested
+                self._use_sparse = False
+                self._n_quad = n_quad
+            elif k > 8:
+                # Large bottleneck: sparse grid is the only tractable option.
+                # Auto-cap level to keep cert under ~5ms:
+                #   k<=16: level=3 → ~20k pts, ~1ms
+                #   k>16:  level=2 → ~5k pts,  ~1ms  (level=3 is ~150k pts, ~73ms)
+                # User can override by passing sparse_level explicitly.
+                if sparse_level == 3 and k > 16:
+                    self._sparse_level = 2
+                self._use_sparse = True
+                self._n_quad = None
             else:
-                n_quad = 4
-        self._n_quad = n_quad or 16
+                # Small k: tensor product with auto n_quad (cap at 200MB)
+                self._use_sparse = False
+                for n in [16, 12, 10, 8, 6, 5, 4]:
+                    if n ** k * k * 8 < 200_000_000:
+                        n_quad = n
+                        break
+                else:
+                    n_quad = 4
+                self._n_quad = n_quad
+        else:
+            self._use_sparse = False
+            self._n_quad = n_quad or 16
 
         # For deep models, fold backbone into single Linear for certification
         if isinstance(model, SwitcherQuadDeepMLP):
@@ -445,12 +615,18 @@ class GPSwitcher:
         x_norm = self._normalize_t(obs)
 
         if self._is_bottleneck:
-            # Bottleneck ReLU: use k-dim Gauss-Hermite quadrature
             with torch.no_grad():
                 logits = self.model(x_norm.unsqueeze(0)).squeeze(0)
             pred = int(logits.argmax().item())
-            pA = certify_bottleneck_pA(self.model, x_norm, self.sigma,
-                                        predicted_class=pred, n_quad=self._n_quad)
+            if self._use_sparse:
+                # Large k: Smolyak sparse Gauss-Hermite
+                pA = certify_bottleneck_sparse_pA(self.model, x_norm, self.sigma,
+                                                   predicted_class=pred,
+                                                   level=self._sparse_level)
+            else:
+                # Small k: tensor-product Gauss-Hermite
+                pA = certify_bottleneck_pA(self.model, x_norm, self.sigma,
+                                            predicted_class=pred, n_quad=self._n_quad)
         elif self._is_skip:
             # Skip pathway: use dedicated certifier (works in input space)
             with torch.no_grad():
@@ -463,9 +639,17 @@ class GPSwitcher:
             with torch.no_grad():
                 logits = self._cert_net(x_norm.unsqueeze(0)).squeeze(0)
             pred = int(logits.argmax().item())
-            obs_dim = x_norm.shape[0]
-            Sigma_in = (self.sigma ** 2) * torch.eye(obs_dim, device=self.device)
-            mu_out, _ = propagate_network(self._cert_net, x_norm, Sigma_in, K=5)
+            # Compute mean output under Gaussian noise efficiently (diagonal-only).
+            # E[phi(h_k)] = a_k^2 + sigma^2 * ||W_in[k,:]||^2 + a_k
+            # avoids building the full (hidden_dim x hidden_dim) covariance matrix.
+            lin_layers = [m for m in self._cert_net if isinstance(m, nn.Linear)]
+            W1, b1 = lin_layers[0].weight, lin_layers[0].bias   # (h, d)
+            W2, b2 = lin_layers[1].weight, lin_layers[1].bias   # (2, h)
+            with torch.no_grad():
+                a = W1 @ x_norm + b1                            # (h,)
+                sigma_h_sq = (self.sigma ** 2) * (W1 ** 2).sum(dim=1)  # (h,)
+                mu_h = a ** 2 + sigma_h_sq + a                  # (h,)
+                mu_out = W2 @ mu_h + b2                         # (2,)
             pA = certify_quad_pA(
                 self._cert_net, x_norm, mu_out, self.sigma,
                 predicted_class=pred,
