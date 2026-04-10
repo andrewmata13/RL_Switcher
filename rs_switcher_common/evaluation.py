@@ -455,6 +455,7 @@ class ContinuousSwitcherController:
 
         pred, p_A_lower, R = self.rs.certify(obs_ppo)
         p_crit = (1.0 - p_A_lower) if pred == 0 else p_A_lower
+        _pred = int(pred)
 
         if self._state == self._PPO:
             certified_safe = (pred == 0) and (R >= self.monitoring_delta)
@@ -477,7 +478,7 @@ class ContinuousSwitcherController:
                 return self.backup.predict(obs_atla), {
                     "allow_perf": 0.0, "p_critical": p_crit,
                     "R_rs": R, "R_exec": float("nan"),
-                    "phase": "atla_enter",
+                    "pred": _pred, "phase": "atla_enter",
                 }
 
             # Blend ATLA→PPO actions during transition window
@@ -490,13 +491,13 @@ class ContinuousSwitcherController:
                 return action, {
                     "allow_perf": alpha, "p_critical": p_crit,
                     "R_rs": R, "R_exec": float("nan"),
-                    "phase": "blend",
+                    "pred": _pred, "phase": "blend",
                 }
 
             return self.perf.predict(obs_ppo), {
                 "allow_perf": 1.0, "p_critical": p_crit,
                 "R_rs": R, "R_exec": float("nan"),
-                "phase": "ppo",
+                "pred": _pred, "phase": "ppo",
             }
 
         else:  # self._state == self._ATLA
@@ -508,7 +509,7 @@ class ContinuousSwitcherController:
                 return self.backup.predict(obs_atla), {
                     "allow_perf": 0.0, "p_critical": p_crit,
                     "R_rs": R, "R_exec": float("nan"),
-                    "phase": "atla_min",
+                    "pred": _pred, "phase": "atla_min",
                 }
 
             if self._exit_window is not None:
@@ -542,18 +543,18 @@ class ContinuousSwitcherController:
                         return action, {
                             "allow_perf": alpha, "p_critical": p_crit,
                             "R_rs": R, "R_exec": R,
-                            "phase": "blend",
+                            "pred": _pred, "phase": "blend",
                         }
                     return self.perf.predict(obs_ppo), {
                         "allow_perf": 1.0, "p_critical": p_crit,
                         "R_rs": R, "R_exec": R,
-                        "phase": "ppo_reenter",
+                        "pred": _pred, "phase": "ppo_reenter",
                     }
 
             return self.backup.predict(obs_atla), {
                 "allow_perf": 0.0, "p_critical": p_crit,
                 "R_rs": R, "R_exec": float("nan"),
-                "phase": "atla",
+                "pred": _pred, "phase": "atla",
             }
 
 
@@ -683,8 +684,21 @@ def evaluate_controller(
         allow_mean = float(np.mean([l["allow_perf"] for l in step_logs]))
         R_vals = [l["R_exec"] for l in step_logs if not np.isnan(l["R_exec"])]
         R_mean = float(np.nanmean(R_vals)) if R_vals else float("nan")
+
+        # Per-step R values split by clean vs attacked (for R-distribution analysis)
+        R_per_step = []
+        for i, sl in enumerate(step_logs):
+            r = sl.get("R_rs", float("nan"))
+            if not np.isnan(r):
+                R_per_step.append({
+                    "t": i, "R": float(r),
+                    "attacked": bool(atk_schedule[i]) if i < len(atk_schedule) else False,
+                    "pred": sl.get("pred", -1),
+                })
+
         logs.append({"allow_perf": allow_mean, "R_exec": R_mean,
                       "fell": fell, "ep_len": t,
-                      "attacked_steps": total_attacked_steps})
+                      "attacked_steps": total_attacked_steps,
+                      "R_per_step": R_per_step})
 
     return returns, logs
