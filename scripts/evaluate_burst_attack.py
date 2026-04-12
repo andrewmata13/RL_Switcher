@@ -3,6 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import argparse
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -18,6 +19,7 @@ from cartpole_rs_switcher.evaluation import (
 )
 from cartpole_rs_switcher.models import SwitcherMLP
 from cartpole_rs_switcher.rs import VanillaRSSwitcher
+from rs_switcher_common.gp_models import load_gp_switcher, GPSwitcher
 
 
 # ==========================================================
@@ -31,7 +33,7 @@ class AttackConfig:
     state_std: np.ndarray = None
     burst_k: int = 5
     horizon_limit: int = 500
-    attack_mode: str = "none"  # one of {none, fixed, oracle}
+    attack_mode: str = "none"  # one of {none, fixed, oracle, random}
     burst_start: int = 25      # used when attack_mode == fixed
 
 
@@ -54,7 +56,7 @@ def rollout_episode(
         attack_start = None
     elif attack_cfg.attack_mode == "fixed":
         attack_start = attack_cfg.burst_start if attack_start_override is None else attack_start_override
-    elif attack_cfg.attack_mode == "oracle":
+    elif attack_cfg.attack_mode in ("oracle", "random"):
         attack_start = attack_start_override
     else:
         raise ValueError(f"Unknown attack_mode={attack_cfg.attack_mode}")
@@ -103,13 +105,18 @@ def evaluate_controller_under_attack(
     Rrs_means: List[float] = []
     Rexec_means: List[float] = []
     chosen_starts: List[int] = []
+    rng = np.random.default_rng(seed)
 
     for ep in range(episodes):
         episode_seed = seed + ep
 
         if attack_cfg.attack_mode in ("none", "fixed"):
             ret, agg = rollout_episode(env_id, controller, perf_policy, episode_seed, attack_cfg)
-        else:
+        elif attack_cfg.attack_mode == "random":
+            max_start = max(0, attack_cfg.horizon_limit - attack_cfg.burst_k)
+            start = int(rng.integers(0, max_start + 1))
+            ret, agg = rollout_episode(env_id, controller, perf_policy, episode_seed, attack_cfg, attack_start_override=start)
+        else:  # oracle
             candidate_starts = list(range(0, attack_cfg.horizon_limit - attack_cfg.burst_k + 1, max(1, attack_cfg.burst_k)))
             best_ret = None
             best_agg = None
@@ -131,6 +138,7 @@ def evaluate_controller_under_attack(
     return {
         "mean_return": float(np.mean(returns)),
         "std_return": float(np.std(returns)),
+        "returns": [float(r) for r in returns],
         "mean_allow_perf": float(np.mean(allow_means)),
         "mean_p_critical": float(np.nanmean(pcrit_means)),
         "mean_p_allow": float(np.nanmean(pallow_means)),
@@ -147,7 +155,10 @@ def evaluate_controller_under_attack(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate CartPole controllers under burst observation attacks.")
     parser.add_argument("--perf-path", type=str, required=True)
-    parser.add_argument("--switcher-path", type=str, required=True)
+    parser.add_argument("--switcher-path", type=str, default=None,
+                        help="MC RS switcher (SwitcherMLP). Mutually exclusive with --gp-switcher-path.")
+    parser.add_argument("--gp-switcher-path", type=str, default=None,
+                        help="GP switcher (SwitcherQuadMLP). Preferred for exact certification.")
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--env-id", type=str, default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=1)
@@ -158,8 +169,9 @@ def main() -> None:
     parser.add_argument("--delta-budget-l2", type=float, required=True)
     parser.add_argument("--epsilon-l2", type=float, default=0.5, help="L2 radius of PGD attack in normalized observation space.")
     parser.add_argument("--burst-k", type=int, default=20)
-    parser.add_argument("--attack-mode", type=str, default="fixed", choices=["none", "fixed", "oracle"])
+    parser.add_argument("--attack-mode", type=str, default="fixed", choices=["none", "fixed", "oracle", "random"])
     parser.add_argument("--burst-start", type=int, default=1)
+    parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -170,13 +182,18 @@ def main() -> None:
     mean = data["state_mean"]
     std = data["state_std"]
 
-    ckpt = torch.load(args.switcher_path, map_location="cpu")
-    switcher = SwitcherMLP(obs_dim=int(ckpt["obs_dim"]), hidden_dim=int(ckpt["hidden_dim"]))
-    switcher.load_state_dict(ckpt["state_dict"])
-    switcher.eval()
-
-    rs = VanillaRSSwitcher(switcher, mean, std, sigma=float(args.sigma),
-                           n_samples=args.n_samples, confidence=args.confidence)
+    if args.gp_switcher_path:
+        ckpt = torch.load(args.gp_switcher_path, map_location="cpu")
+        rs = GPSwitcher(load_gp_switcher(ckpt), mean, std, sigma=float(args.sigma))
+    elif args.switcher_path:
+        ckpt = torch.load(args.switcher_path, map_location="cpu")
+        switcher = SwitcherMLP(obs_dim=int(ckpt["obs_dim"]), hidden_dim=int(ckpt["hidden_dim"]))
+        switcher.load_state_dict(ckpt["state_dict"])
+        switcher.eval()
+        rs = VanillaRSSwitcher(switcher, mean, std, sigma=float(args.sigma),
+                               n_samples=args.n_samples, confidence=args.confidence)
+    else:
+        raise ValueError("Must provide --switcher-path or --gp-switcher-path")
 
     attack_cfg = AttackConfig(
         epsilon_l2=float(args.epsilon_l2),
@@ -203,6 +220,7 @@ def main() -> None:
     print(f"n_samples={args.n_samples} confidence={args.confidence}")
     print()
 
+    all_results = {}
     for name, controller in controllers.items():
         metrics = evaluate_controller_under_attack(
             env_id=args.env_id,
@@ -212,6 +230,7 @@ def main() -> None:
             seed=args.seed,
             attack_cfg=attack_cfg,
         )
+        all_results[name] = metrics
         print(f"[{name}]")
         print(f"  mean return      = {metrics['mean_return']:.2f}")
         print(f"  std return       = {metrics['std_return']:.2f}")
@@ -221,6 +240,14 @@ def main() -> None:
         print(f"  mean R_exec      = {metrics['mean_R_exec']:.4f}")
         print(f"  mean attack_start= {metrics['attack_start_mean']:.1f}")
         print()
+
+    if args.output_json:
+        output_path = args.output_json
+        config = {k: v for k, v in vars(args).items() if k != "output_json"}
+        out = {"config": config, **all_results}
+        with open(output_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Saved results to {output_path}")
 
 
 if __name__ == "__main__":

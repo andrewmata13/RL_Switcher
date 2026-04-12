@@ -1,585 +1,161 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Setup
 
 Use `python3.8` (has all dependencies pre-installed). Run all scripts from the repo root.
-
-```bash
-pip install -r requirements.txt  # if setting up a new environment
-```
 
 Dependencies: `gymnasium`, `numpy`, `scipy`, `torch`, `stable-baselines3`.
 
 ---
 
-## Method Overview
+## Core Idea
 
-### Core Idea
+At each step, choose between a **PPO policy** (high return, adversarially vulnerable) and a **safe backup** (robust, lower return). A binary **switcher** trained with Randomized Smoothing (RS) detects adversarial observations.
 
-At each step, choose between a **high-performance PPO policy** (higher return, vulnerable to adversarial attacks) and a **safe ATLA backup policy** (robust but lower return). A binary **switcher** trained with Randomized Smoothing (RS) noise augmentation detects adversarial obs. Two controller variants manage transitions via a 4-phase state machine:
-- **AnyTimeSwitcherController**: fixed-length ATLA recovery (recovery_k steps)
-- **AdaptiveSwitcherController** (preferred): adaptive ATLA recovery -- monitors via RS during backup, exits when recovery_confirm_k consecutive certified-safe steps observed
+**Proper certification**: `certified_safe = (pred==0) AND (R >= delta)`. Never use pred-only — requires `R >= delta` for the formal guarantee.
 
-Two certification backends:
-- **VanillaRSSwitcher** (MC RS): `SwitcherMLP`, `SwitcherDeepMLP`, or `SwitcherRobustMLP`, statistical lower bound via sampling
-- **GPSwitcher** (Gil-Pelaez): `SwitcherQuadMLP` with x^2+x activation, exact analytical certification, ~2-4ms constant time
+**Labels**: y=0 (clean PPO obs), y=1 (opt_attacked obs). 50/50 split.
 
-**Proper certification**: `certified_safe = (pred==0) AND (R >= delta)`. Never use pred-only (`monitoring_delta=0.0`) — this discards the RS guarantee and gives empirical detection only. The guarantee requires `R >= delta` to hold.
+**Two certification backends**:
+- **VanillaRSSwitcher** (MC RS): `SwitcherMLP`/`SwitcherDeepMLP`/`SwitcherRobustMLP`; statistical lower bound via Clopper-Pearson
+- **GPSwitcher** (Gil-Pelaez): `SwitcherQuadMLP` with x²+x activation; exact analytical cert, ~2-5ms CPU, **preferred**
 
-### Labeling (adversarial detection, not criticality)
+---
 
-- **y=0** (non-critical / clean): raw observation from PPO rollout
-- **y=1** (critical / adversarial): `obs + tanh(attack_net(obs)) * eps` -- the Zhang et al. optimal adversary applied to the same obs
+## Controllers
 
-50/50 split by construction. The switcher learns to detect adversarial perturbation.
+### ContinuousSwitcherController — **primary controller for paper**
 
-### Randomized Smoothing Certification
-
-`VanillaRSSwitcher.certify(obs)`:
-1. Samples `n_samples` noisy copies: `obs + N(0, sigma^2 I)` in ZFilter-normalized space
-2. Counts majority vote -> Clopper-Pearson lower bound `p_A_lower` at `confidence=0.001`
-3. Returns `(pred, p_A_lower, R)` where `R = sigma * Phi^-1(p_A_lower)`
-
-Guarantee: if `pred==0` and any L2 perturbation `||delta||_2 <= R` is applied, the prediction remains class 0.
-
-### 4-Phase Controller State Machine
-
-Both `AnyTimeSwitcherController` and `AdaptiveSwitcherController` share the same 4-phase structure. They differ only in Phase 2.
-
+Hysteresis-based loop (no permanent commit), handles multi-burst / repeated attacks:
 ```
-Phase 1 -- PPO Monitoring (default state)
-    Every step: RS-certify obs_ppo; use PPO for control
-    "certified_safe" = (pred==0) AND (R >= monitoring_delta)
-    detection_k consecutive NOT-certified-safe steps -> Phase 2
-
-Phase 2 -- ATLA Recovery
-    AnyTime:  fixed recovery_k steps, no RS calls
-    Adaptive: RS-certify each step; recovery_confirm_k consecutive
-              certified-safe steps -> Phase 3 (no fixed cap)
-    -> Phase 3
-
-Phase 3 -- RS Commit Check  (at most commit_timeout_k steps)
-    RS-certify; first step with (pred==0) AND (R >= delta_budget_l2) -> Phase 4
-    Forced commit after commit_timeout_k steps regardless
-    -> Phase 4
-
-Phase 4 -- Committed PPO  (permanent, rest of episode)
-    PPO only; no further RS calls
-    Justified by single-attack-per-episode threat model
+PPO state: alarm_count += 1 if NOT certified; -= forgive_decay if certified
+           alarm_count >= K_enter → ATLA
+ATLA state: safe_count += 1 if certified; = 0 otherwise
+            safe_count >= K_exit → PPO
 ```
 
-**Why permanent commit (not loop)?** With a loop, Phase 1 restarts after recovery. P(false alarm per step) ~ 10-40% depending on env -> the controller spends most of the episode in ATLA via repeated false alarms. Permanent commit avoids this since the adversary fires at most once per episode.
+**Key insight**: K_enter suppresses false alarms (P(K_enter consecutive alarms) exponentially small). forgive_decay=1.0 (don't tune this — it doesn't help).
 
-**Adaptive vs AnyTime**: The adaptive controller doesn't need to know burst_k in advance. During an active attack, adversarial obs consistently fail certification, so the controller naturally stays in ATLA. After the attack ends, it exits ATLA once the environment stabilizes (recovery_confirm_k consecutive safe steps). The AnyTime controller requires recovery_k >= burst_k to be set correctly.
+**Attack modes**: `single` (one burst, random T), `multi` (n_bursts × burst_k, cooldown_k gap), `arbitrary` (Bernoulli per step).
 
-**Dual ZFilter normalization**: Two independent ZFilters are maintained simultaneously:
-- **PPO ZFilter** (from `Attack_PPO.model`'s `custom_env`): applied by `custom_env.step()` -> `obs_ppo`; used for PPO inference and RS certification
-- **ATLA ZFilter** (from `ATLA.model`'s `custom_env.state_filter`): applied to raw sim obs -> `obs_atla`; used for ATLA inference
-
-Per-step PPO<->ATLA switching is avoided in Phase 1 to prevent ZFilter churn (incompatible normalizations causing instability).
-
-**Attack models**: `evaluate_controller()` supports three attack modes via `attack_mode`:
-- `"single"` — one burst per episode (original). T ~ U[0, t_candidate_max], lasts `burst_k` steps.
-- `"multi"` — `n_bursts` bursts of `burst_k` steps each, with at least `cooldown_k` gap between bursts.
-- `"arbitrary"` — each step independently attacked with Bernoulli probability (expected total ≈ `burst_k` steps).
-
-PPO obs are perturbed; ATLA obs (from raw sim state) are always clean. Supports both L-inf and L2 attacks via `attack_norm` parameter.
-
-### ContinuousSwitcherController (arbitrary attacks)
-
-For arbitrary (multi-burst, repeated) attacks, the 4-phase permanent-commit design breaks because the attacker can strike again after Phase 4. `ContinuousSwitcherController` uses hysteresis-based switching that loops indefinitely:
+### 4-Phase (single-burst, Hopper only)
 
 ```
-State: PPO (monitoring)
-    RS-certify each step; track alarm_count.
-    not certified safe -> alarm_count += 1
-    certified safe     -> alarm_count = max(0, alarm_count - forgive_decay)
-    alarm_count >= K_enter -> switch to ATLA
-
-State: ATLA (recovery)
-    RS-certify each step; track safe_count.
-    certified safe     -> safe_count += 1
-    not certified safe -> safe_count = 0
-    safe_count >= K_exit -> switch to PPO
+Phase 1: PPO + RS-certify each step
+  detection_k consecutive NOT-certified-safe → Phase 2
+Phase 2: ATLA recovery
+  Adaptive: recovery_confirm_k consecutive certified-safe → Phase 3
+Phase 3: RS Commit Check (≤ commit_timeout_k steps)
+  First certified-safe → Phase 4; forced commit after timeout
+Phase 4: Committed PPO (permanent)
 ```
-
-**Hysteresis parameters**:
-- `K_enter`: consecutive alarm threshold to enter ATLA. Higher = more false alarm resistant, slower detection.
-- `K_exit`: consecutive safe steps to return to PPO. Higher = more conservative recovery.
-- `forgive_decay`: how fast alarm_count decays on safe steps. Higher = requires denser unsafe clusters to trigger.
-- `monitoring_delta`: R threshold for Phase 1 detection (same as 4-phase controllers).
-
-**Why hysteresis solves the false alarm problem**: With symmetric thresholds (K_enter = K_exit = 1, no forgive), the controller degrades to per-step switching — equivalent to looping Phase 1→2→1, spending most time in ATLA. Asymmetric thresholds with forgive_decay > 0 mean: scattered false alarms are forgiven and don't accumulate, but genuine attack bursts (where multiple consecutive steps fail certification) trigger ATLA entry. On the exit side, the controller stays in ATLA until the attack clearly stops.
-
-**Per-step formal guarantee**: Each step the controller certifies. If pred==0 and R >= delta, the switcher prediction is provably robust within radius R regardless of attack timing. The hysteresis only governs the switching policy, not the per-step safety certificate.
 
 ---
 
 ## Code Organization
 
-### Shared package: `rs_switcher_common/`
-
-All shared infrastructure for MuJoCo environments lives in `rs_switcher_common/`:
+### `rs_switcher_common/`
 
 | File | Role |
 |------|------|
-| `env_config.py` | `EnvConfig` dataclass + `HOPPER`/`HALFCHEETAH`/`WALKER2D` configs + `ENV_REGISTRY` |
-| `models.py` | `SwitcherMLP` (1-hidden-layer), `SwitcherDeepMLP` (multi-layer ReLU), `SwitcherRobustMLP` (wide+BN+Dropout), `load_switcher()` |
-| `rs.py` | `VanillaRSSwitcher`: GPU-accelerated MC RS; `certify()` returns `(pred, p_A_lower, R)` |
+| `env_config.py` | `EnvConfig` + `HOPPER`/`HALFCHEETAH`/`WALKER2D` + `ENV_REGISTRY` |
+| `models.py` | `SwitcherMLP`, `SwitcherDeepMLP`, `SwitcherRobustMLP`, `load_switcher()` |
+| `gp_models.py` | `SwitcherQuadMLP`, `GPSwitcher`, `load_gp_switcher()` |
+| `rs.py` | `VanillaRSSwitcher`: certify() returns `(pred, p_A_lower, R)` |
 | `controllers.py` | `MuJoCoPerfPolicy` (PPO + Zhang attack), `MuJoCoBackupPolicy` (ATLA), `raw_obs_from_sim()` |
-| `evaluation.py` | `AlwaysPerfController`, `AlwaysBackupController`, `AnyTimeSwitcherController`, `AdaptiveSwitcherController`, `ContinuousSwitcherController`, `evaluate_controller()` |
-| `attacks.py` | `opt_attack()`: pre-trained adversary in normalized obs space (supports L-inf and L2 norms) |
-| `labeling.py` | `CriticalBurstLabeler`: detection dataset builder; `collect_state_stats()` |
-| `training.py` | `train_switcher()`: BCE + noise augmentation (supports `SwitcherMLP`, `SwitcherDeepMLP`, `SwitcherRobustMLP`); AdamW + cosine LR + n_noise_copies |
-| `utils.py` | `set_seed`, `normalize`, `denormalize_eps` |
-| `compat.py` | `ensure_paths()`, `patch_gym_env()` (gym 0.26 compatibility) |
-| `clean_policies.py` | `CleanPerfPolicy`, `CleanBackupPolicy`, `PPOAsBackup`, `DegradedPPOBackup` (frozen-norm policies) |
-| `gp_models.py` | `SwitcherQuadMLP`, `SwitcherQuadDeepMLP`, `SwitcherQuadSkipMLP`, `SwitcherBottleneckMLP`, `GPSwitcher` (Gil-Pelaez certifier), `load_gp_switcher()` |
+| `evaluation.py` | `AlwaysPerfController`, `AlwaysBackupController`, `AdaptiveSwitcherController`, `ContinuousSwitcherController`, `evaluate_controller()` |
+| `attacks.py` | `opt_attack()`: pre-trained adversary, L-inf and L2 |
+| `labeling.py` | `CriticalBurstLabeler`, `collect_state_stats()` |
+| `training.py` | `train_switcher()`: BCE + noise augmentation, AdamW + cosine LR |
+| `clean_policies.py` | `CleanPerfPolicy`, `CleanBackupPolicy`, `PPOAsBackup` |
+| `compat.py` | `patch_gym_env()` (gym 0.26 compatibility) |
 
-### Gil-Pelaez (GP) Single-Pass Certification
+### `cartpole_rs_switcher/`
 
-`Single_Pass_Smoothing/` contains the GP certification library. `rs_switcher_common/gp_models.py` wraps it for the switcher:
+CartPole-specific: PGD attack, LQR backup, certified switcher controller.
 
-- **`SwitcherQuadMLP`**: 2-class model with `Linear -> x^2+x -> Linear` architecture. The x^2+x activation enables exact analytical certification (no MC sampling).
-- **`SwitcherQuadDeepMLP`**: Stacked `Linear+BN` backbone before x^2+x. At eval time, all Linear+BN layers fold into a single affine map via `fold_backbone()`, so certification still sees `Linear -> x^2+x -> Linear`. BN helps training optimization but doesn't increase eval-time capacity.
-- **`SwitcherQuadSkipMLP`**: Parallel quad pathway (x²+x) + linear skip pathway. Architecture: `[W_quad @ x → x²+x; W_skip @ x] → cat → Linear(2)`. Margin under Gaussian noise is still generalized chi-squared — skip contribution adds to the linear coefficients in the eigendecomposed quadratic form without changing the structure. Use `certify_quad_skip_pA()`. Same speed as `SwitcherQuadMLP`. Accuracy ceiling: ~95.1% (same as pure quad — parallel linear features don't add capacity beyond x²+x's own +x term).
-- **`SwitcherBottleneckMLP`**: `Linear(obs_dim, k) -> ReLU -> Linear(k, 2)`. Certified via k-dimensional Gauss-Hermite quadrature over the pre-activation Gaussian. Strictly more expressive than x²+x (piecewise-linear vs degree-2 polynomial), but hits the **quadrature curse-of-dimensionality**: cert cost scales as n^k. See "Architecture Comparison" table below.
-- **`GPSwitcher`**: Drop-in replacement for `VanillaRSSwitcher`. Same `certify()` API returning `(pred, p_A_lower, R)`. Auto-selects n_quad for bottleneck models to stay within 200MB memory. Accepts `n_quad` kwarg override.
-- **`load_gp_switcher(ckpt)`**: Reconstructs any GP model from checkpoint dict based on `model_type` key (`"quad"`, `"quad_deep"`, `"quad_skip"`, `"bottleneck"`).
-- **Key advantage**: For binary classification (2 classes), GP has NO union bound penalty -- the certificate is exact.
-- **Speed**: ~2-5ms/obs on CPU (constant, independent of sample count). RS scales linearly with n_samples.
-- **Training**: Use `scripts/train_switcher_gp.py` with margin loss for better certified radii. Add `--arch bottleneck` for bottleneck model; `--skip-dim N` for skip pathway.
+### Checkpoint conventions
 
-GP certification time per environment (CPU, h=512 for quad/skip):
-
-| Env | quad/skip time | Fits 8ms budget |
-|---|---|---|
-| Hopper (11D) | ~1.8 ms | Yes |
-| HalfCheetah (17D) | ~3-5 ms | Yes |
-| Walker2D (17D) | ~3.3 ms | Yes |
-
-**Architecture comparison (HalfCheetah, σ=0.2, 200 clean obs):**
-
-| Model | Accuracy | Cert time | Mean R | frac R≥0.10 | frac R≥0.30 | Fits 8ms |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| `SwitcherQuadMLP` h=512 | 95.1% | ~3ms | 0.324 | 94.5% | 53.0% | Yes |
-| `SwitcherQuadSkipMLP` q=512 s=128 | 95.1% | ~5ms | 0.324 | 94.5% | 53.0% | Yes |
-| `SwitcherBottleneckMLP` k=4 | 91.2% | ~2ms | 0.298 | 83.0% | 41.5% | Yes |
-| `SwitcherBottleneckMLP` k=8 | 94.7% | ~14ms | — | — | — | **No** |
-
-**Bottleneck finding**: x²+x and skip both ceiling at ~95.1%. Bottleneck k=4 is fast (2ms, n_quad=8) but weaker — fewer certified steps despite being piecewise-linear. k=8 approaches accuracy (94.7%) but 14ms exceeds the 8ms budget. The fundamental tradeoff: n^k quadrature cost grows exponentially, so you can't get both high capacity (large k) and fast certification. **Recommendation: use `SwitcherQuadSkipMLP` or `SwitcherQuadMLP` h=512 as the default GP certifier.**
-
-### SwitcherRobustMLP (wide RS-certified classifier)
-
-For MC RS certification, wider networks with BN and Dropout substantially improve accuracy, which directly translates to higher certified fractions (more steps where `R >= delta`).
-
-**Architecture**: `[Linear(obs_dim, h) -> BN -> ReLU -> Dropout] * N -> Linear(h_last, 1)`
-- Default: `hidden_dims=[1024, 1024, 512, 512, 256]`, `dropout=0.1`
-- BN uses running stats at eval time → compatible with RS certification (deterministic output)
-- Dropout disabled at eval → deterministic certification
-
-**Training improvements** over `SwitcherMLP`/`SwitcherDeepMLP`:
-- **AdamW** (weight decay in param update, not gradient) + **cosine LR schedule** (lr→lr*0.01)
-- **n_noise_copies=4**: each sample expanded to K noisy copies per step, better approximates the smoothed classifier objective
-
-```bash
-# Train robust RS switcher
-python3.8 scripts/train_switcher.py \
-    --dataset data/halfcheetah_critical_dataset.npz \
-    --output models/halfcheetah_switcher_robust.pt \
-    --model-type robust --hidden-dims 1024,1024,512,512,256 --dropout 0.1 \
-    --epochs 500 --sigma 0.2 --n-noise-copies 4 --lr 3e-4 --weight-decay 1e-4 \
-    --lr-schedule cosine
-```
-
-**Checkpoint format**: `{"state_dict": ..., "obs_dim": int, "model_type": "robust", "hidden_dims": [...], "dropout": float}`
-Use `load_switcher(ckpt)` from `rs_switcher_common/models.py` to reconstruct any switcher type.
-
-**Sigma sweep insight**: The optimal certification sigma is NOT the training sigma. Certifying at `sigma_cert = sigma_train / 2` gives higher `p_A` per obs, which more than compensates for the smaller sigma in `R = sigma * Φ⁻¹(p_A)`. Example: Hopper at sigma_train=0.1, sigma_cert=0.05 → 88% of clean steps certify at R≥0.05 (vs 16.5% with GP at R≥0.075).
-
-**Pre-built models**:
-- `models/hopper_switcher_robust.pt` (sigma=0.1, 99.2% accuracy, hidden_dims=[1024,1024,512,512,256])
-- `models/halfcheetah_switcher_robust.pt` (sigma=0.2, 99.9% accuracy)
-
-### CartPole package: `cartpole_rs_switcher/`
-
-CartPole-specific code (PGD attack, LQR backup, gymnasium-based eval):
-
-| File | Role |
-|------|------|
-| `controllers.py` | `PerfPolicy` (SB3 PPO) and `QuantizedLQRBackup` |
-| `evaluation.py` | `CertifiedSwitcherController` (Phase 1 only -- no 4-phase state machine) |
-| `attacks.py` | `pgd_l2_attack()`: targeted PGD in normalized obs space |
-| `labeling.py` | `CriticalBurstLabeler`: PGD burst attacks to label critical/non-critical |
-| `config.py` | `LabelConfig`, `SwitcherTrainConfig`, `EvalConfig` dataclasses |
-| `models.py`, `rs.py`, `training.py`, `utils.py` | Re-exports from `rs_switcher_common` |
-
-### Environment configuration
-
-`EnvConfig` in `rs_switcher_common/env_config.py` encodes per-env differences:
-
-| Param | Hopper | HalfCheetah | Walker2D |
-|-------|--------|-------------|----------|
-| `name` | `"Hopper"` | `"Cheetah"` | `"Walker2D"` |
-| `obs_dim` | 11 | 17 | 17 |
-| `action_dim` | 3 | 6 | 6 |
-| `eps` | 0.075 | 0.15 | 0.05 |
-| `qpos_slice` | (1, 6) | (1, 9) | (1, 9) |
-| `qvel_slice` | (0, 6) | (0, 9) | (0, 9) |
-| `qvel_clip` | 10.0 | None | 10.0 |
+- **Attack checkpoint** (`HalfCheetah_Attack_PPO.model`): contains `policy_model`, `adversary_policy_model`, `envs[0]`. All three MUST come from the same file.
+- **ATLA checkpoint**: use `Attack_ATLA` file (not bare `ATLA.model`) for its own ZFilter.
+- **`policy_gradients/`**: required at repo root for unpickling `.model` files. Do not delete.
+- **Switcher ckpt keys**: `state_dict`, `obs_dim`, `model_type`, `hidden_dim(s)`. Use `load_switcher()` or `load_gp_switcher()`.
+- **Dataset `.npz` keys**: `X`, `y`, `state_mean`, `state_std`
+- All L2 quantities (`sigma`, `R`, `delta`, `eps`) are in **ZFilter-normalized obs space**
 
 ---
 
-## CartPole Pipeline
+## GP Switcher Architecture
 
-### Workflow
+`SwitcherQuadMLP`: `Linear → x²+x → Linear(2)`. Exact analytical certification via Gil-Pelaez, no MC sampling.
 
-```bash
-# 1. Train performance PPO policy (10k steps -- weak enough to fail under attack)
-python3.8 scripts/train_perf.py --output models/perf_cartpole_ppo.zip --timesteps 10000
+**Architecture winner**: `SwitcherQuadMLP h=512` (~95% accuracy on HalfCheetah, ~3ms cert). Use quad h=512 by default.
 
-# 2. Build critical-state labels dataset
-python3.8 scripts/build_labels.py \
-  --perf-path models/perf_cartpole_weak \
-  --dataset-out data/critical_dataset.npz \
-  --epsilon-l2 0.5 \
-  --burst-k 10 \
-  --horizon-h 100 \
-  --reward-drop-threshold 30 \
-  --pgd-steps 10 \
-  --n-attack-starts 3 \
-  --episodes 8 \
-  --subsample-every 4
+**Sigma insight**: certify at `sigma_cert = sigma_train / 2` → higher p_A → larger R despite smaller sigma.
 
-# 3. Train binary switcher with RS noise augmentation
-python3.8 scripts/train_switcher.py \
-  --dataset data/critical_dataset.npz \
-  --output models/switcher.pt \
-  --hidden-dim 64 \
-  --epochs 500 \
-  --sigma 0.25
-
-# 4. Evaluate under burst attacks
-python3.8 scripts/evaluate_burst_attack.py \
-  --perf-path models/perf_cartpole_weak \
-  --switcher-path models/switcher.pt \
-  --dataset data/critical_dataset.npz \
-  --sigma 0.25 \
-  --n-samples 1000 \
-  --delta-budget-l2 0.5 \
-  --epsilon-l2 0.5 \
-  --burst-k 10 \
-  --attack-mode fixed \
-  --episodes 20
-```
-
-Pre-built artifacts:
-- `data/critical_dataset.npz`
-- `models/perf_cartpole_weak.zip` (10k steps -- use this, not perf_cartpole_ppo)
-- `models/switcher.pt`
-
-**Note:** `stable-baselines3` appends `.zip` automatically -- pass paths **without** `.zip` extension.
-
-### Architecture (CartPole-specific)
-
-CartPole uses **PGD L2 attacks** (not the Zhang et al. optimal adversary) for labeling. The backup is a **quantized LQR** (Riccati solution), not ATLA. Uses `CertifiedSwitcherController` (Phase 1 only -- no 4-phase state machine).
-
-### Key findings
-
-- **Weak PPO (10k steps)**: clean return ~363, vulnerable to eps=0.5. Certified switcher: clean=500, attacked=500.
-- **Strong PPO (20k+ steps)**: unbreakable -- visits only equilibrium states, critical fraction = 0%.
-- **Targeted PGD**: `attacks.py` uses `targeted=True` (default); minimizes `logit[clean] - logit[target]`.
-- **Phase transition**: at ~19k steps PPO becomes fully robust; use 10k steps for meaningful experiments.
-- **CartPole state_std** ~ `[0.045, 0.136, 0.0055, 0.202]` (pole_angle std 25x smaller than cart_vel -- all L2 quantities must be in normalized space).
+**`SwitcherRobustMLP`** (for MC RS): wide BN+Dropout network, trained with n_noise_copies=4 + cosine LR. Best accuracy (99%+).
 
 ---
 
-## MuJoCo Pipeline (Hopper, HalfCheetah, Walker2D)
+## Per-Environment Results
 
-All MuJoCo environments use the same unified scripts with `--env` parameter.
+### CartPole — toy example in paper (COMPLETE)
 
-### Workflow
+**Setup**: 15k-step PPO (`models/perf_cartpole_15000k.zip`), LQR backup (`QuantizedLQRBackup`), GP switcher. MuJoCo-style labeling (no criticality criterion — strong policies have no critical states). PGD L2 attack, eps=1.0, burst=200 oracle.
 
-```bash
-# 1. Build adversarial-detection dataset (clean -> y=0, opt_attacked -> y=1, 50/50 split)
-python3.8 scripts/build_labels_mujoco.py --env hopper \
-    --perf-path   Hopper/Hopper_PPO.model \
-    --attack-path Hopper/Hopper_Attack_PPO.model \
-    --dataset-out data/hopper_critical_dataset.npz \
-    --episodes 20 --subsample-every 5
+**Results** (50 episodes, paper config):
 
-# 2. Train GP switcher (preferred -- exact certification)
-python3.8 scripts/train_switcher_gp.py \
-    --dataset data/hopper_critical_dataset.npz \
-    --output models/hopper_switcher_gp_h512.pt \
-    --hidden-dim 512 --epochs 500 --sigma 0.1
-
-# 3. Evaluate with adaptive controller under L2 attack
-python3.8 scripts/evaluate_burst_attack_gp.py --env hopper \
-    --perf-path   Hopper/Hopper_PPO.model \
-    --attack-path Hopper/Hopper_Attack_PPO.model \
-    --backup-path Hopper/Hopper_ATLA.model \
-    --gp-switcher-path models/hopper_switcher_gp_h512.pt \
-    --dataset data/hopper_critical_dataset.npz \
-    --sigma 0.1 --delta-budget-l2 0.075 \
-    --episodes 30 --seed 0 --burst-k 75 --t-candidate-max 100 \
-    --recovery-confirm-k 10 --commit-timeout-k 5 \
-    --attack-norm l2 --attack-eps 0.13 \
-    --output-json results/hopper_adaptive_l2.json
-
-# 4. Worst-case T* evaluation (finds hardest attack start time)
-python3.8 scripts/evaluate_worst_case_start.py --env hopper \
-    --perf-path   Hopper/Hopper_PPO.model \
-    --attack-path Hopper/Hopper_Attack_PPO.model \
-    --backup-path Hopper/Hopper_ATLA.model \
-    --switcher-path models/hopper_switcher.pt \
-    --dataset data/hopper_critical_dataset.npz \
-    --seeds 30 --device cpu
-```
-
-### Hopper
-
-- `obs_dim=11`, `action_dim=3`, `eps=0.075` (L-inf), `name="Hopper"`
-- uState: `qpos[6] + qvel[6] = 12D`; obs = normalized 11D via PPO ZFilter
-- Raw 11D obs: `qpos[1:6] + clip(qvel[:6], -10, 10)`
-- Termination: `height > 0.7 and |ang| < 0.2` (never fires for good PPO); hard `max_steps=1000` cap. "Fall" = `done=True` before step 1000.
-- Pre-built: `data/hopper_critical_dataset.npz` (7918 samples)
-- GP model: `models/hopper_switcher_gp_h512.pt` (sigma=0.1, ~85% accuracy, hidden_dim=512)
-- RS model (small): `models/hopper_switcher.pt` (sigma=0.1, 94.1% accuracy, hidden_dim=64)
-- RS model (robust): `models/hopper_switcher_robust.pt` (sigma=0.1, 99.2% accuracy, hidden_dims=[1024,1024,512,512,256])
-- **Hopper bottleneck**: `Hopper_Attack_ATLA.model` (correct backup) falls 8/10 as always_backup → continuous controller unusable until better ATLA trained. Use HalfCheetah for continuous controller experiments.
-
-**Adaptive GP results (seed 0, 30 episodes, L2 attack eps=0.13, burst_k=75):**
-
-| Controller | Clean return | Attacked return | Falls (clean) | Falls (attacked) |
-|---|:---:|:---:|:---:|:---:|
-| Always PPO | 3614 +/- 59 | 2572 +/- 1380 | 1/30 | **12/30** |
-| Always ATLA | 2694 +/- 948 | 2375 +/- 886 | 20/30 | 24/30 |
-| **Adaptive GP** | **3601 +/- 147** | **3474 +/- 410** | **2/30** | **5/30** |
-
-| Param | Value | Rationale |
+| | Clean | Attacked (burst=200) |
 |---|---|---|
-| `sigma` | 0.1 | Balances accuracy (~85% GP) and cert radius |
-| `delta_budget_l2` | 0.075 | Controller detection/commit threshold |
-| `L2 attack eps` | 0.13 | Causes meaningful degradation (PPO: 3614->2572) |
-| `detection_k` | 2 | Fast detection |
-| `recovery_confirm_k` | 10 | Adaptive exit from ATLA |
-| `commit_timeout_k` | 5 | Max steps in commit check before forced PPO |
+| Always PPO | 500 | 107 |
+| Always LQR | 500 | 500 |
+| GP Switcher (ours) | 500 | **500** |
 
-### Hopper (Clean Pipeline — ZFilter-Free)
-
-A second Hopper pipeline eliminates ZFilter normalization entirely, replacing it with a single frozen mean/std computed once from clean rollouts (Welford online estimator during PPO training). Both PPO and ATLA share these frozen stats, eliminating all ZFilter switching instability.
-
-**Key design decisions**:
-- `train_clean_ppo.py` trains PPO with `RunningNorm` (frozen after training); saves `{policy_model, norm_mean, norm_std}`
-- `build_clean_dataset.py` stores **normalized** obs (not raw): `obs_ppo = (raw - norm_mean) / norm_std`; `state_mean/state_std ≈ 0/1` so `GPSwitcher._normalize_t` is a near no-op
-- Dataset MUST use PPO-only trajectories (not ATLA). Adding ATLA obs degrades accuracy or causes mode collapse.
-
-**Critical bug found and fixed**: Original `data/hopper_clean_dataset.npz` stored RAW obs with raw-space stats (mean[0]≈1.30, Hopper height). At inference, GPSwitcher received already-normalized obs (≈0) and computed (0-1.30)/0.17=-7.6 — completely OOD → 100% wrong predictions → 19-20/20 falls.
+**Paper config**: `sigma=0.25`, `delta=0.25`, `delta_budget_l2=0.25`, `burst=200`, `eps=1.0`, `K_enter=5`, `K_exit=5`
 
 **Artifacts**:
-- PPO: `Hopper/Hopper_Clean_PPO.pt` (frozen norm stats embedded)
-- ATLA: `Hopper/Hopper_Clean_ATLA.pt`
-- Adversary: `Hopper/Hopper_Clean_PPO_Adv.pt` (separate adversary checkpoint)
-- Dataset: `data/hopper_clean_ppoonly.npz` (12000 samples, PPO-only, state_mean≈0, state_std≈1)
-- GP model: `models/hopper_clean_gp.pt` (sigma=0.1, 87.9% accuracy, hidden_dim=512)
-
-**Evaluation** (use `--clean` flag): `scripts/evaluate_continuous_controller.py --clean --perf-path Hopper/Hopper_Clean_PPO.pt --attack-path Hopper/Hopper_Clean_PPO_Adv.pt --backup-path Hopper/Hopper_Clean_ATLA.pt`
-
-**Results (100 episodes, seeds 0-4, L2 attack eps=0.13, burst_k=75, dk=10, rck=10, ctk=5):**
-
-| Controller | Clean return | Clean falls | Attacked return | Attacked falls |
-|---|:---:|:---:|:---:|:---:|
-| Always PPO | 3572 ± 9 | 0% | 1486 ± 1166 | **78%** |
-| Always ATLA | 3458 ± 26 | 0% | 3427 ± 316 | 1% |
-| **Adaptive GP** | **3480 ± 172** | **4%** | **3250 ± 702** | **15%** |
-
-Results saved to `results/hopper_clean_multiseed.json`.
-
-**Key findings from clean pipeline**:
-- Per-step cert fail rate (pred=1 OR R<0.075) on clean PPO: **59.5%**, not 12.9%. The R<0.075 condition filters 46.6% of steps that have pred=0 but small certified radius.
-- Phase 1 dk=10 triggers: ~18.8 per 1000 steps (run lengths: mean=7.1, 22.4% of runs ≥10 steps long). Frequent false alarm entries into Phase 2.
-- Phase 2 exits QUICKLY (~17 steps) on false alarm entries because the state is still near PPO trajectory — cert safe rate near-PPO is much higher than 41.9% ATLA average.
-- False alarms help attacked performance: pre-attack Phase 4 commit puts controller in permanent PPO before the attack starts, partially protecting early attack exposure.
-- Optimal: `monitoring_delta=None` (=0.075), `detection_k=10`, `recovery_confirm_k=10`, `commit_timeout_k=5`. Smaller monitoring_delta removes the beneficial false alarm mechanism, worsening attacked performance.
-
-**Continuous controller broken for Hopper with ATLA v1 backup — SOLVED with PPOAsBackup**:
-
-Root cause (ATLA v1): ATLA v1 has a slightly different gait period. After ~100 steps of ATLA from a mid-episode PPO state, the robot is ~180° out of phase with what PPO expects. Transition at "danger zone" episode steps (e.g., 150, 220) caused 40-57% fall rates.
-
-**Fix: `PPOAsBackup`** (`rs_switcher_common/clean_policies.py`): uses the PPO policy itself as the backup.
-- Key insight: `obs_atla = raw_obs_from_sim()` always provides clean (unperturbed) simulator state. The adversary only perturbs `obs_ppo`, never `obs_atla`.
-- PPO on clean obs produces correct PPO actions → same gait → 0% transition fall rate at ANY episode timing.
-- Attack neutralized: even during attack, backup (PPO on clean obs) gives correct actions.
-- **Limitation**: backup ≈ PPO → always_backup ≈ always_perf → no reward gap → switcher value appears only in falls, not reward. Use HalfCheetah for reward-based comparison.
-
-Also available: `DegradedPPOBackup` (PPO + Gaussian action noise at inference, `--backup-action-noise sigma`). Tested but collapses Hopper at sigma=0.1 (16/20 falls). Not useful for Hopper; might work for more forgiving environments.
-
-**Use `--ppo-as-backup` flag** with `--clean` in `evaluate_continuous_controller.py`. Backup path not required.
-
-**Dataset**: `data/hopper_clean_v1_l2eps02.npz` (24000 samples, includes ATLA v1 recovery states as y=0)
-**Switcher**: `models/hopper_clean_robust_v1_l2eps02.pt` (RobustMLP [1024,1024,512,512,256], sigma=0.1, 98.3% accuracy)
-**Cert params**: `sigma_cert=0.05`, `delta=0.05`, `n_samples=500` → 84% of clean PPO steps certify
-
-**ContinuousSwitcherController results (PPOAsBackup, RS certifier, seed=0, 30 episodes, L2 eps=0.13, K_enter=2, K_exit=5):**
-
-| Attack mode | Controller | Return | Falls |
-|---|:---:|:---:|:---:|
-| Single burst (75 steps) | always_perf | 1761 | 22/30 |
-| Single burst (75 steps) | **continuous_rs** | **3569** | **0/30** |
-| Multi (3×75 burst/75 gap) | always_perf | 1161 | 28/30 |
-| Multi (3×75 burst/75 gap) | **continuous_rs** | **3481** | **4/30** |
-| Arbitrary (Bernoulli ~75 steps) | always_perf | 3475 | 2/30 |
-| Arbitrary (Bernoulli ~75 steps) | **continuous_rs** | **3570** | **0/30** |
+- PPO: `models/perf_cartpole_15000k.zip` (100% episodes reach 500 clean)
+- Dataset: `data/cartpole_15k_dataset.npz` (100k samples, 50/50, MuJoCo-style labeling)
+- GP switcher: `models/cartpole_15k_gp.pt` (sigma=0.25, hidden=64, 99.9% accuracy)
+- Results: `results/cartpole_15k_gp2_clean.json`, `results/cartpole_15k_gp_bk200.json`
 
 ```bash
-# Evaluate ContinuousSwitcherController with PPO-as-backup
-python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
-    --perf-path Hopper/Hopper_Clean_PPO.pt \
-    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
-    --ppo-as-backup \
-    --rs-switcher-path models/hopper_clean_robust_v1_l2eps02.pt \
-    --dataset data/hopper_clean_v1_l2eps02.npz \
-    --sigma 0.05 --delta-budget-l2 0.05 --n-samples 500 \
-    --episodes 30 --seed 0 \
-    --attack-mode multi --n-bursts 3 --burst-k 75 --cooldown-k 75 \
-    --K-enter 2 --K-exit 5 --forgive-decay 1.0 \
-    --attack-norm l2 --attack-eps 0.13 \
-    --output-json results/hopper_ppo_backup_multi.json
+# Evaluate CartPole (attacked)
+python3.8 scripts/evaluate_burst_attack.py \
+    --perf-path models/perf_cartpole_15000k.zip \
+    --gp-switcher-path models/cartpole_15k_gp.pt \
+    --dataset data/cartpole_15k_dataset.npz \
+    --sigma 0.25 --delta-budget-l2 0.25 \
+    --episodes 50 --seed 0 --epsilon-l2 1.0 --burst-k 200 \
+    --attack-mode oracle --output-json results/cartpole_result.json
 ```
 
-**Build commands**:
-```bash
-# Train clean PPO
-python3.8 scripts/train_clean_ppo.py --env hopper \
-    --output Hopper/Hopper_Clean_PPO.pt --total-steps 1000000 --seed 0
+**Note**: Do NOT use criticality-based labeling for CartPole — strong policies have no critical states. Build dataset by collecting clean PPO rollouts (y=0) and PGD-attacked versions (y=1) directly.
 
-# Build dataset (PPO-only normalized obs)
-python3.8 scripts/build_clean_dataset.py --env hopper \
-    --ppo-path Hopper/Hopper_Clean_PPO.pt \
-    --adv-path Hopper/Hopper_Clean_PPO_Adv.pt \
-    --backup-path Hopper/Hopper_Clean_ATLA.pt \
-    --dataset-out data/hopper_clean_ppoonly.npz \
-    --episodes 30 --subsample-every 5
+---
 
-# Train GP switcher
-python3.8 scripts/train_switcher_gp.py \
-    --dataset data/hopper_clean_ppoonly.npz \
-    --output models/hopper_clean_gp.pt \
-    --hidden-dim 512 --epochs 500 --sigma 0.1
+### HalfCheetah — **main env** (COMPLETE)
 
-# Evaluate adaptive controller
-python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
-    --perf-path Hopper/Hopper_Clean_PPO.pt \
-    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
-    --backup-path Hopper/Hopper_Clean_ATLA.pt \
-    --gp-switcher-path models/hopper_clean_gp.pt \
-    --dataset data/hopper_clean_ppoonly.npz \
-    --sigma 0.1 --delta-budget-l2 0.075 \
-    --episodes 30 --seed 0 \
-    --attack-mode single --burst-k 75 --t-candidate-max 100 \
-    --detection-k 10 --recovery-confirm-k 10 --commit-timeout-k 5 \
-    --attack-norm l2 --attack-eps 0.13
-```
+**Paper config** (continuous GP, multi-burst 3×100/100, L2 eps=0.5, 30 episodes):
+- `sigma=0.2`, `delta=0.2`, `K_enter=5`, `K_exit=5`, `forgive_decay=1.0`
 
-**Hopper backup constraint — why reward-based continuous controller story doesn't work for Hopper:**
+**Results** (30 episodes, median [IQR]):
 
-Any backup with a different policy than PPO (e.g., ATLA) has a different gait period. After N steps of ATLA from a mid-episode PPO state, the robot is out of phase. ATLA→PPO transitions at danger-zone episode steps (e.g., 150, 220) cause 40–67% fall rates. This makes the continuous controller unreliable regardless of K_enter/K_exit tuning.
+| | Clean | Single (burst=300) | Multi (3×100) | Arbitrary (E=300) |
+|---|---|---|---|---|
+| Always PPO | 7242 | 4082 | 3168 | — |
+| Always ATLA | 5646 | 5641 | 5649 | — |
+| Cont. GP (ours) | 7132 | 6687 | 6598 | ~6500 |
 
-Attempts to make the backup weaker while preserving gait compatibility all failed:
-- Obs-noise training (sigma=0.01–0.10): policy collapses to 400 return / 20/20 falls (Hopper needs sub-1% obs precision)
-- Action-noise inference (sigma=0.1): 16/20 falls (needs precise torques)
-- Short PPO training (600k steps): return unstable (~1900–3200), not a reliable weaker backup
+**Detection analysis** at delta=0.2: TNR=70.1%, TPR=79.7%, burst-level detection 100% for 100-step bursts (K_enter=5). Two-regime: ‖δ‖≤0.2 → provably correct; ‖δ‖>0.2 → certificate collapses → detection signal.
 
-| Backup approach | Weaker than PPO? | Gait-compatible? | Result |
-|---|:---:|:---:|:---:|
-| ATLA backup | Yes (3453 vs 3574, −3.3%) | No | 15–30/30 transition falls |
-| Obs-noise training | No | Collapses | 20/20 falls during training |
-| Action-noise inference | No | Collapses | 16/20 falls at sigma=0.1 |
-| PPOAsBackup | No (3572 ≈ 3574) | Yes — 0/30 falls | No reward gap |
-
-**Conclusion**: For the continuous controller reward story, use HalfCheetah (ATLA 22% weaker, no falls). For Hopper, use the adaptive 4-phase controller with ATLA backup for single-burst attacks (GP certifier, dk=10, rck=10):
-
-| Controller | Clean | Single-burst attacked | PPO% clean | PPO% attacked |
-|---|:---:|:---:|:---:|:---:|
-| always_perf | 3495 | 1697 | 100% | 100% |
-| always_backup | 3458 | 3454 | 0% | 0% |
-| **adaptive_gp** | **3441** | **3317** | **96.5%** | **94.5%** |
+**Artifacts**:
+- `models/halfcheetah_switcher_gp_s02.pt` (sigma=0.2, 95.2%)
+- `data/halfcheetah_critical_dataset.npz`
+- Results: `results/halfcheetah_paper_multi.json`, `results/halfcheetah_paper_single.json`, `results/halfcheetah_paper_arb300.json`
+- R-distribution data: `results/halfcheetah_R_distribution.json`
 
 ```bash
-# Adaptive controller for Hopper (single burst)
-python3.8 scripts/evaluate_continuous_controller.py --env hopper --clean \
-    --perf-path Hopper/Hopper_Clean_PPO.pt \
-    --attack-path Hopper/Hopper_Clean_PPO_Adv.pt \
-    --backup-path Hopper/Hopper_Clean_ATLA.pt \
-    --gp-switcher-path models/hopper_clean_gp.pt \
-    --dataset data/hopper_clean_ppoonly.npz \
-    --sigma 0.1 --delta-budget-l2 0.075 --episodes 30 --seed 0 \
-    --attack-mode single --burst-k 75 --t-candidate-max 100 \
-    --detection-k 10 --recovery-confirm-k 10 --commit-timeout-k 5 \
-    --attack-norm l2 --attack-eps 0.13 \
-    --output-json results/hopper_adaptive_single.json
-```
-
-### HalfCheetah
-
-- `obs_dim=17`, `action_dim=6`, `eps=0.15` (L-inf), `name="Cheetah"`
-- uState: `qpos[9] + qvel[9] = 18D`; obs = ZFilter-normalized 17D
-- Raw 17D obs: `qpos[1:9] + qvel[:9]` (8D + 9D, no velocity clipping)
-- HalfCheetah **never terminates**; story is return degradation, not falls. Hard `max_steps=1000` cap.
-- Pre-built: `data/halfcheetah_critical_dataset.npz`
-- GP model: `models/halfcheetah_switcher_gp_s02.pt` (sigma=0.2, 95.2% accuracy, hidden_dim=512)
-- RS model: `models/halfcheetah_switcher_robust.pt` (sigma=0.2, 99.9% accuracy, hidden_dims=[1024,1024,512,512,256])
-
-**Adaptive GP results (seed 0, 30 episodes, L2 attack eps=0.50, burst_k=100):**
-
-| Controller | Clean return | Attacked return |
-|---|:---:|:---:|
-| Always PPO | 7267 +/- 108 | 5728 +/- 1822 |
-| Always ATLA | 5638 +/- 48 | 5624 +/- 45 |
-| **Adaptive GP** | **6931 +/- 1159** | **6445 +/- 1354** |
-
-| Param | Value |
-|---|---|
-| `sigma` | 0.2 |
-| `delta_budget_l2` | 0.30 |
-| `L2 attack eps` | 0.50 |
-| `detection_k` | 5 |
-| `recovery_confirm_k` | 3 |
-
-**ContinuousSwitcherController — Optimized GP (paper configuration)**
-
-Hyperparameter sweep over delta ∈ {0.05, 0.1, 0.2, 0.3, 0.4}, K_enter ∈ {2,3,5}, K_exit ∈ {3,5,10} (10 episodes each, `scripts/sweep_continuous_gp.py`). Multi-burst attack: 3×100 steps, 100-step cooldown, L2 eps=0.5.
-
-**Sweep winner: `delta=0.2, K_enter=5, K_exit=5, forgive_decay=1.0`**
-
-| delta | K_enter | K_exit | Clean (median) | Attacked (median) | PPO% clean | PPO% attacked |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 0.1 | 3 | 5 | 7092 | 6680 | 93.8% | 60.5% |
-| 0.1 | 5 | 5 | 7172 | 6671 | 99.4% | 63.3% |
-| **0.2** | **5** | **5** | **7125** | **6534** | **92.7%** | **60.2%** |
-| 0.3 | 5 | 5 | 6230 | 6096 | 39.5% | 30.1% |
-| 0.4 | 5 | 5 | 5691 | 5669 | 6.5% | 5.0% |
-
-Baselines (10 eps): Always-PPO attacked median=3956, Always-ATLA clean median=5679.
-
-**Why delta=0.2 over delta=0.1**: delta=0.2 provides a stronger formal claim (certified within radius 0.2 = 40% of attacker's budget) with minimal performance cost (~50 return less than delta=0.1). K_exit=5 is the sweet spot — K_exit=3 exits ATLA too fast, K_exit=10 gets stuck. K_enter=5 gives 99%+ clean PPO time.
-
-**Recommended paper configuration**:
-
-| Param | Value | Rationale |
-|---|---|---|
-| `sigma` | 0.2 | GP training sigma |
-| `delta_budget_l2` | 0.2 | 40% of attack budget; formal per-step guarantee |
-| `K_enter` | 5 | Suppresses false alarms (P(5 consecutive) ≈ 2.4×10⁻³) |
-| `K_exit` | 5 | Fast recovery after attack ends |
-| `forgive_decay` | 1.0 | Standard decay |
-| `L2 attack eps` | 0.5 | Causes PPO degradation (7200→3956) |
-
-```bash
-# Evaluate optimized continuous GP controller on HalfCheetah
 python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \
     --perf-path HalfCheetah/HalfCheetah_PPO.model \
     --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \
@@ -590,301 +166,119 @@ python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \
     --attack-mode multi --n-bursts 3 --burst-k 100 --cooldown-k 100 \
     --K-enter 5 --K-exit 5 --forgive-decay 1.0 \
     --attack-norm l2 --attack-eps 0.5 \
-    --output-json results/halfcheetah_cont_multi.json
-
-# Sweep script (27 configs, ~2h on CPU)
-python3.8 scripts/sweep_continuous_gp.py \
-    --env halfcheetah \
-    --perf-path HalfCheetah/HalfCheetah_PPO.model \
-    --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \
-    --backup-path HalfCheetah/HalfCheetah_ATLA.model \
-    --gp-switcher-path models/halfcheetah_switcher_gp_s02.pt \
-    --dataset data/halfcheetah_critical_dataset.npz \
-    --sigma 0.2 --episodes 10 --seed 0 \
-    --attack-mode multi --n-bursts 3 --burst-k 100 --cooldown-k 100 \
-    --attack-norm l2 --attack-eps 0.5 \
-    --output-json results/halfcheetah_gp_sweep.json
+    --output-json results/halfcheetah_paper_multi.json
 ```
-
-### Detection Analysis: Certificate Collapse and Burst-Level Guarantees
-
-The detection signal is `NOT (pred==0 AND R >= delta)`. Two mechanisms contribute:
-
-1. **Prediction flip** (pred 0→1): catches 67% of attacked steps at delta=0 (no radius needed)
-2. **Certificate threshold** (pred=0 but R < delta): catches additional attacked steps where prediction didn't flip but certificate is weak
-
-**Per-step detection rates (HalfCheetah, GP sigma=0.2, L2 eps=0.5, 10 episodes):**
-
-| delta | Clean certified (TNR) | Attacked detected (TPR) | FPR | FNR |
-|:---:|:---:|:---:|:---:|:---:|
-| 0.0 (pred-only) | 88.3% | 66.7% | 11.7% | 33.3% |
-| 0.1 | 83.2% | 74.4% | 16.8% | 25.6% |
-| **0.2** | **70.1%** | **79.7%** | **29.9%** | **20.3%** |
-| 0.3 | 48.1% | 85.2% | 51.9% | 14.8% |
-
-Raw prediction accuracy: 88.3% of clean steps get pred=0 (correct), 66.7% of attacked steps get pred=1 (correct).
-
-**Burst-level detection probability (MC simulation, 100k trials):**
-
-Per-step FNR of 20.3% is manageable because attacks are bursts. Over many attacked steps, the probability of never triggering K_enter consecutive alarms is negligible:
-
-| delta | K_enter | Burst=50 steps | Burst=100 steps | P(false entry/episode) |
-|:---:|:---:|:---:|:---:|:---:|
-| 0.0 | 5 | 94.5% | 99.7% | 1.9% |
-| 0.1 | 5 | 99.2% | 99.99% | 10.5% |
-| **0.2** | **5** | **99.9%** | **100%** | **81.2%** |
-| 0.3 | 5 | 100% | 100% | 100% |
-
-At **delta=0.2, K_enter=5**: burst detection is effectively perfect (0 misses in 10⁵ MC trials for 100-step bursts). The 81% false entry rate is mitigated by fast K_exit=5 recovery — controller enters ATLA briefly on false alarms but returns to PPO within 5 steps, preserving 93% PPO utilization.
-
-**Two-regime formal argument for the paper:**
-> For ‖δ‖₂ ≤ 0.2: the switcher's per-step prediction is provably correct (formal RS/GP guarantee). For ‖δ‖₂ > 0.2: the perturbation overwhelms the certificate, causing either pred=1 (direct detection) or R collapse below delta (indirect detection). The controller is robust in both regimes — by proof in the first, by certificate collapse in the second. With K_enter=5 hysteresis, the burst-level detection probability is 100% for bursts ≥ 100 steps.
-
-**Certified false alarm bound**: P(false alarm/step) = 0.299. P(5 consecutive) = 2.37×10⁻³. This bounds the per-5-step-window probability of spurious ATLA entry.
-
-```bash
-# Collect R distribution and detection metrics
-python3.8 scripts/collect_R_distribution.py --env halfcheetah \
-    --perf-path HalfCheetah/HalfCheetah_PPO.model \
-    --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \
-    --backup-path HalfCheetah/HalfCheetah_ATLA.model \
-    --gp-switcher-path models/halfcheetah_switcher_gp_s02.pt \
-    --dataset data/halfcheetah_critical_dataset.npz \
-    --sigma 0.2 --delta-budget-l2 0.2 \
-    --episodes 10 --seed 0 \
-    --attack-mode multi --n-bursts 3 --burst-k 100 --cooldown-k 100 \
-    --attack-norm l2 --attack-eps 0.5 \
-    --K-enter 5 --K-exit 5 \
-    --output-json results/halfcheetah_R_distribution.json
-```
-
-### Walker2D
-
-- `obs_dim=17`, `action_dim=6`, `eps=0.05` (L-inf), `name="Walker2D"`. Models in `Walker2D/`.
-- Pre-built: `data/walker2d_critical_dataset.npz` (7838 samples)
-- GP model: `models/walker2d_switcher_gp.pt` (sigma=0.1, 79% accuracy, hidden_dim=512)
-
-**Adaptive GP results (seed 0, 30 episodes, L2 attack eps=0.10, burst_k=75):**
-
-| Controller | Clean return | Attacked return | Falls (clean) | Falls (attacked) |
-|---|:---:|:---:|:---:|:---:|
-| Always PPO | 4590 +/- 222 | 3996 +/- 1281 | 1/30 | 7/30 |
-| Always ATLA | 3606 +/- 758 | 3524 +/- 886 | 8/30 | 9/30 |
-| **Adaptive GP** | **4172 +/- 1116** | **4327 +/- 937** | **4/30** | **2/30** |
-
-| Param | Value |
-|---|---|
-| `sigma` | 0.1 |
-| `delta_budget_l2` | 0.05 |
-| `monitoring_delta` | 0.0 (**pred-only — bypasses formal RS guarantee**; empirical detection only) |
-| `L2 attack eps` | 0.10 |
-| `detection_k` | 2 |
-| `recovery_confirm_k` | 5 |
 
 ---
 
-## Checkpoint and path conventions
+### Hopper — secondary stories (NOT in paper)
 
-- **Attack checkpoint** (e.g. `Hopper_Attack_PPO.model`): contains `policy_model`, `adversary_policy_model`, `envs[0]`. All three MUST come from the same file for consistent ZFilter statistics.
-- **ATLA checkpoint** (e.g. `Hopper_Attack_ATLA.model` — use the `Attack_ATLA` file, not bare `ATLA.model`): provides its own ZFilter via `custom_env.state_filter`.
-- **custom_env API**: `reset(uState, None, name=...)` -> normalized obs; `step(action, change_filter=False, name=...)` -> `(result, norm_rew, is_done, info)` where `result[1]` is the next normalized obs.
-- **`policy_gradients/`**: required at repo root for `torch.load` unpickling of `.model` checkpoints. Do not delete.
-- **gym 0.26**: `patch_gym_env()` in `rs_switcher_common/compat.py` converts 5-tuple step returns to 4-tuple.
+**Story 1: Adaptive 4-phase + ATLA backup (single-burst)**
+Clean pipeline (frozen normalization, no ZFilter). Use `--clean` flag.
+- `sigma=0.1`, `delta=0.075`, `detection_k=10`, `recovery_confirm_k=10`, `commit_timeout_k=5`
+- Clean 3480±172 (4% falls), Attacked 3250±702 (15% falls) — 100 eps
 
-## Shared conventions
+**Story 2: PPOAsBackup + continuous controller**
+`PPOAsBackup` reads `raw_obs_from_sim()` (always clean). Same gait → 0% transition falls.
+- `sigma_cert=0.05`, `delta=0.05`, `K_enter=2`, `K_exit=5`
+- Single burst: 0/30 falls vs always_PPO 22/30
 
-- **All L2 quantities** (`epsilon_l2`, `delta_budget_l2`, `sigma`, `R`) are in **ZFilter-normalized observation space**
-- **`p1 = P(critical)`**: pred==0 -> non-critical -> use PPO; pred==1 -> critical -> use ATLA
-- **Switcher checkpoint format**: `{"state_dict": ..., "obs_dim": int, "hidden_dim": int}` (may include `hidden_dims` for deep models, `model_type`/`backbone_dims` for GP models, `dropout` for robust models). Use `load_switcher(ckpt)` to reconstruct any type.
-- **Dataset `.npz` keys**: `X`, `y`, `state_mean`, `state_std`
-- **`pos_weight = neg / pos`** in training: up-weights the critical class
-- **Import path**: `other_attacks/optimal_attack/opt_pg/models.py` (renamed from `policy_gradients/` to avoid conflict)
-- **Episode total reward**: read from `perf.custom_env.total_true_reward` after episode ends
+**Artifacts**: `Hopper/Hopper_Clean_PPO.pt`, `Hopper/Hopper_Clean_ATLA.pt`, `data/hopper_clean_ppoonly.npz`, `models/hopper_clean_gp.pt`
 
----
+**Hopper v2** (in progress, not for paper): ATLA v2/v3 in `Hopper/atla_v2_ckpts/`. Gait mismatch unsolved.
 
-## Open Problems and Future Work
-
-### Certification radius vs attack strength gap
-
-The fundamental tension: certified radii are small, and at those small L2 budgets the attack barely hurts. There's a gap between what we can certify and what actually degrades the policy.
-
-**Current state** (GP certification, clean observations):
-
-| Env | sigma | Avg certified R | L2 eps that degrades PPO | % clean obs with R >= eps |
-|---|---|---|---|---|
-| Hopper | 0.1 | 0.079 | 0.13 | 16.5% |
-| HalfCheetah | 0.2 | 0.323 | 0.50 | 14.5% |
-| Walker2D | 0.1 | 0.090 | 0.10 | 36.0% |
-
-**With SwitcherRobustMLP + smaller cert sigma** (99%+ accuracy, n_samples=300-500):
-
-| Env | train sigma | cert sigma | cert delta | % clean obs certified |
-|---|---|---|---|---|
-| Hopper | 0.1 | 0.05 | 0.05 | ~88% |
-| HalfCheetah | 0.2 | 0.10 | 0.10 | ~99.5% |
-
-Key insight: certify at `sigma_cert = sigma_train / 2`. Higher accuracy → p_A close to 1 → R = sigma*Φ⁻¹(p_A) stays large even with smaller sigma. The certified fraction matters more than avg R for controller usability.
-
-The certificate says: "if R >= delta, then no perturbation within delta can flip the prediction." For full formal guarantees, we need `delta = L2_eps` (the attacker's budget). But with `delta = L2_eps`, most clean observations fail certification (84-86% false alarm rate for GP), making the controller unusable.
-
-**Resolution: two-regime detection via certificate collapse** (see "Detection Analysis" under HalfCheetah):
-
-The gap does NOT invalidate the method. The certificate serves dual purpose:
-1. **Formal regime (‖δ‖₂ ≤ R)**: per-step prediction is provably correct
-2. **Detection regime (‖δ‖₂ > R)**: perturbation destroys the certificate (pred flips or R collapses below delta), which IS the detection signal
-
-At delta=0.2 on HalfCheetah (attack eps=0.5): 79.7% per-step detection rate, 100% burst-level detection for 100-step bursts (K_enter=5). The attacker faces a dilemma: perturb weakly (within R) and cause no PPO damage, or perturb strongly and get detected via certificate collapse.
-
-**Remaining avenues to tighten the gap**:
-
-1. **Train at higher sigma**: R = sigma * Phi^-1(pA). Tested up to sigma=0.3 on Hopper -- accuracy drops (~71% GP at sigma=0.3 vs ~85% at sigma=0.1) but radii increase. Diminishing returns beyond sigma=0.3 for the x^2+x architecture.
-
-2. **Stronger architectures for GP** (EXHAUSTED): All variants tested (SwitcherQuadDeepMLP, SwitcherQuadSkipMLP, SwitcherBottleneckMLP). No certifiable architecture beats x²+x at h=512 within the 8ms budget.
-
-3. **Retrain the adversary in L2** (IN PROGRESS): See "L2 Native Adversary" section below. Preliminary Hopper results: native L2 adversary causes massive damage at eps=0.10 (close to certifiable R=0.079), shrinking the gap.
-
-4. **Tighter certification methods**: GP is exact for x^2+x but the architecture limits radii. Lipschitz-bounded networks or interval bound propagation could help.
+**Critical past bug**: Do NOT store raw obs in dataset. Must store normalized obs. If state_mean[0] ≈ 1.3 (Hopper height), dataset has raw obs.
 
 ---
 
-## L2 Native Adversary (In Progress)
+### Walker2D (INCOMPLETE, not in paper)
 
-### Motivation
+Continuous controller broken (returns 527-1178 vs always_backup 3544-3674). ATLA gait incompatibility.
+Likely needs PPOAsBackup approach (not yet tried).
 
-The existing adversaries are trained for L-inf attacks. When evaluated under L2 norm, the perturbation direction is suboptimal (post-hoc projection of L-inf directions onto L2 ball). A natively L2-trained adversary finds more damaging L2 perturbation directions, causing greater PPO degradation at the same L2 budget. This shrinks the gap between what hurts the policy and what can be certified.
+---
 
-### Changes to Zhang et al. framework
+## Figures (poster_figures/)
 
-`other_attacks/optimal_attack/opt_pg/agent.py` — three perturbation projection sites (trajectory collection, perturbed state collection, `apply_attack`) modified to support L2 norm via `getattr(self.params, 'ADV_NORM', 'linf')`. When `adv_norm == 'l2'`, replaces per-dimension hardtanh+bounds clamping with L2 ball projection:
-```python
-p_norm = perturbation.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
-perturbation = perturbation / p_norm * float(self.ADV_EPS)
-```
+Three figures generated by scripts in `scripts/`:
 
-`config.json` — added `"adv_norm": "linf"` (default preserves backward compatibility).
-`run.py` — added `--adv-norm` CLI argument.
-
-### Training script: `scripts/train_l2_adversary.py`
-
-Standalone PPO-based trainer (bypasses the full Zhang et al. Trainer which has environment wrapper incompatibilities for Hopper). Two modes:
-
-| Mode | What trains | Use case |
-|------|-------------|----------|
-| `--mode adv-only` | L2 adversary against **frozen** PPO | Step 1: find L2 attack directions |
-| `--mode minimax` | ATLA policy + L2 adversary co-train | Step 2: make ATLA robust to L2 attacks |
-
-Key features:
-- Uses **true reward** (via `total_true_reward` differencing), not normalized reward. The normalized reward is ~100x weaker and prevents adversary convergence.
-- `--warm-start` flag for minimax mode: loads existing ATLA weights for faster convergence.
-- Saves in standard checkpoint format (compatible with `MuJoCoPerfPolicy.load`).
-
-### Training budget finding
-
-The L-inf training uses per-dimension budget `(bounds_range) * eps = 10 * 0.075 = 0.75`, giving effective L2 norm up to ~2.49. Training an L2 adversary at the evaluation budget (eps=0.13) is far too small -- the adversary cannot learn (PPO return stays at ~3618). Training at eps=0.5 produces a strong adversary.
-
-### Preliminary Hopper results (L2 adversary trained at eps=0.5)
-
-**PPO return under L2 attack at various eval budgets (30 episodes, clean baseline: 3614):**
-
-| L2 eval eps | L-inf projected | Native L2 | Avg certified R |
-|:-----------:|:---------------:|:---------:|:---------------:|
-| 0.05 | — | 3626 | 0.079 |
-| 0.10 | — | **1050** | 0.079 |
-| 0.13 | 479 | 751 | 0.079 |
-| 0.20 | 382 | 457 | 0.079 |
-
-Key findings:
-- Native L2 adversary causes massive damage at eps=0.10 (3614 -> 1050), close to the certifiable radius of 0.079.
-- At eps=0.13, the L-inf projected adversary is actually more damaging (479 vs 751) because its directions were optimized at a larger training budget. Both cause 100% falls.
-- The gap between certifiable R (0.079) and "L2 eps that hurts" shrinks from 0.13 to ~0.075 with the native L2 adversary.
-
-### Remaining steps
-
-1. **Train ATLA with L2 adversary (minimax)**: Use `--mode minimax --warm-start Hopper/Hopper_ATLA.model` for fast convergence. Verify clean return ≈ 2694 (current ATLA).
-2. **Rebuild detection dataset**: `build_labels_mujoco.py --attack-path Hopper/Hopper_Attack_PPO_L2.model`
-3. **Retrain switcher**: `train_switcher_gp.py` on new L2-based dataset.
-4. **Evaluate full adaptive controller**: `evaluate_burst_attack_gp.py --attack-norm l2` with L2-ATLA, L2 adversary, L2 switcher.
-5. **Extend to HalfCheetah and Walker2D**.
-
-### GPU commands (ready to run)
+| Figure | Script | Data |
+|--------|--------|------|
+| `bar_chart.pdf` | `plot_bar_chart.py` | `results/halfcheetah_paper_*.json`, `results/cartpole_15k_gp*.json` |
+| `r_distribution.pdf` | `plot_r_distribution.py` | `results/halfcheetah_R_distribution.json` |
+| `episode_trace.pdf` | `plot_episode_trace.py` | live rollout, seed=4 |
 
 ```bash
-# Train robust RS switchers (all envs, ~10 min each on GPU)
-python3.8 scripts/train_switcher.py \
-    --dataset data/walker2d_critical_dataset.npz \
-    --output models/walker2d_switcher_robust.pt \
-    --model-type robust --hidden-dims 1024,1024,512,512,256 --dropout 0.1 \
-    --epochs 500 --sigma 0.1 --n-noise-copies 4 --lr 3e-4 --weight-decay 1e-4 \
-    --lr-schedule cosine
+python3.8 scripts/plot_bar_chart.py
+python3.8 scripts/plot_r_distribution.py
+python3.8 scripts/plot_episode_trace.py --seed 4
+```
 
-# Evaluate continuous controller (Walker2D, 30 episodes)
-python3.8 scripts/evaluate_continuous_controller.py --env walker2d \
-    --perf-path Walker2D/Walker2D_PPO.model \
-    --attack-path Walker2D/Walker2D_Attack_PPO.model \
-    --backup-path Walker2D/Walker2D_ATLA.model \
-    --rs-switcher-path models/walker2d_switcher_robust.pt \
-    --dataset data/walker2d_critical_dataset.npz \
-    --sigma 0.05 --delta-budget-l2 0.05 \
-    --n-samples 1000 --episodes 30 --seed 0 \
-    --attack-mode multi --n-bursts 3 --burst-k 75 --cooldown-k 75 \
-    --K-enter 3 --K-exit 10 \
-    --attack-norm l2 --attack-eps 0.10
+---
 
-# Run K_enter/K_exit/delta sweep on HalfCheetah (GP, completed)
-python3.8 scripts/sweep_continuous_gp.py \
-    --env halfcheetah \
-    --perf-path HalfCheetah/HalfCheetah_PPO.model \
+## MuJoCo Pipeline (build from scratch)
+
+```bash
+# 1. Build dataset (clean y=0, opt-attacked y=1)
+python3.8 scripts/build_labels_mujoco.py --env halfcheetah \
+    --perf-path HalfCheetah/HalfCheetah_Attack_PPO.model \
     --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \
-    --backup-path HalfCheetah/HalfCheetah_ATLA.model \
-    --gp-switcher-path models/halfcheetah_switcher_gp_s02.pt \
-    --dataset data/halfcheetah_critical_dataset.npz \
-    --sigma 0.2 --episodes 10 --seed 0 \
-    --attack-mode multi --n-bursts 3 --burst-k 100 --cooldown-k 100 \
-    --attack-norm l2 --attack-eps 0.5 \
-    --deltas 0.05,0.1,0.2 --K-enters 2,3,5 --K-exits 3,5,10 \
-    --output-json results/halfcheetah_gp_sweep.json
-```
-
-```bash
-# Step 1: L2 adversary (already done for Hopper, ~40 min CPU)
-python3.8 scripts/train_l2_adversary.py --mode adv-only --env hopper \
-    --attack-path Hopper/Hopper_Attack_PPO.model \
-    --eps 0.5 --train-steps 500 --rollout-len 2048 \
-    --lr 3e-4 --val-lr 1e-3 --entropy-coeff 0.001 \
-    --seed 0 --output Hopper/Hopper_Attack_PPO_L2.model
-
-# Step 2: ATLA minimax (warm-start, ~2-4 hours CPU)
-python3.8 scripts/train_l2_adversary.py --mode minimax --env hopper \
-    --attack-path Hopper/Hopper_Attack_PPO.model \
-    --warm-start Hopper/Hopper_ATLA.model \
-    --eps 0.5 --train-steps 500 --rollout-len 2048 \
-    --lr 3e-4 --adv-lr 3e-5 --seed 0 \
-    --output Hopper/Hopper_ATLA_L2.model
-
-# Step 3: Rebuild dataset
-python3.8 scripts/build_labels_mujoco.py --env hopper \
-    --perf-path Hopper/Hopper_PPO.model \
-    --attack-path Hopper/Hopper_Attack_PPO_L2.model \
-    --dataset-out data/hopper_l2_critical_dataset.npz \
+    --dataset-out data/halfcheetah_critical_dataset.npz \
     --episodes 20 --subsample-every 5
 
-# Step 4: Retrain GP switcher
+# 2. Train GP switcher
 python3.8 scripts/train_switcher_gp.py \
-    --dataset data/hopper_l2_critical_dataset.npz \
-    --output models/hopper_switcher_gp_l2.pt \
-    --hidden-dim 512 --epochs 500 --sigma 0.1
+    --dataset data/halfcheetah_critical_dataset.npz \
+    --output models/halfcheetah_switcher_gp_s02.pt \
+    --hidden-dim 512 --epochs 500 --sigma 0.2
 
-# Step 5: Evaluate adaptive controller
-python3.8 scripts/evaluate_burst_attack_gp.py --env hopper \
-    --perf-path Hopper/Hopper_PPO.model \
-    --attack-path Hopper/Hopper_Attack_PPO_L2.model \
-    --backup-path Hopper/Hopper_ATLA_L2.model \
-    --gp-switcher-path models/hopper_switcher_gp_l2.pt \
-    --dataset data/hopper_l2_critical_dataset.npz \
-    --sigma 0.1 --delta-budget-l2 0.075 \
-    --episodes 30 --seed 0 --burst-k 75 --t-candidate-max 100 \
-    --recovery-confirm-k 10 --commit-timeout-k 5 \
-    --attack-norm l2 --attack-eps 0.10 \
-    --output-json results/hopper_adaptive_l2_native.json
+# 3. Evaluate
+python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \
+    [see command above]
 ```
+
+---
+
+## Certification Gap Summary
+
+| Env | sigma | Avg cert R | L2 eps that hurts PPO | Resolution |
+|-----|-------|-----------|----------------------|------------|
+| CartPole | 0.25 | ~0.4 | 1.0 | Two-regime detection |
+| HalfCheetah | 0.2 | 0.323 | 0.50 | Two-regime detection |
+| Hopper | 0.1 | 0.079 | 0.13 | small gap |
+| Walker2D | 0.1 | 0.090 | 0.10 | small gap |
+
+**Two-regime detection**: Within R → provably correct. Beyond R → certificate collapses → IS the detection signal. At delta=0.2 (HalfCheetah): 100% burst-level detection for 100-step bursts with K_enter=5.
+
+---
+
+## Paper Plan (ACNS 2026, 5 pages)
+
+**Scope**: CartPole (toy) + HalfCheetah (main), continuous switcher only, multi-burst primary threat model.
+
+**Structure**:
+
+1. **Introduction** (~0.5p) — adversarial attacks on RL; gap: existing defenses are static or uncertified; contribution: runtime certified switching with repeated-attack guarantee.
+
+2. **Background** (~0.5p) — Randomized Smoothing, Gil-Pelaez certification, threat model (L2 bounded, observation-only adversary, multi-burst).
+
+3. **Method** (~1.5p)
+   - GP Switcher: `SwitcherQuadMLP` (x²+x activation), training (BCE + noise aug, 50/50 clean/attacked), Gil-Pelaez exact cert
+   - `ContinuousSwitcherController`: hysteresis loop (K_enter/K_exit), false-alarm bound (P(false alarm) ≤ p_A^K_enter), two-regime detection argument
+
+4. **Experiments** (~1.5p)
+   - CartPole: toy demonstration (PPO median 107 → Switcher 500 under burst=200, eps=1.0)
+   - HalfCheetah: main table (clean / single burst=300 / multi 3×100 / arbitrary E=300), vs always-PPO and always-ATLA
+   - Three figures: bar chart, R-distribution (certificate collapse), episode trace
+
+5. **Conclusion** (~0.25p) — limitations (cert gap, Walker2D gait), future work.
+
+**Figures** (all generated, in `poster_figures/`):
+- `bar_chart.pdf` — main results (HalfCheetah + CartPole panels, broken y-axis)
+- `r_distribution.pdf` — motivates two-regime detection argument
+- `episode_trace.pdf` — qualitative: ATLA switch during attack window, seed=4
+
+**Still needed**:
+- Arbitrary-attack HalfCheetah number in results table (`results/halfcheetah_paper_arb300.json`)
+- Detection guarantee derivation / theorem box
+- Related work (ATLA, SA-RL, Zhang et al., RS in RL)
