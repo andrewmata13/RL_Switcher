@@ -9,7 +9,11 @@
       "Bash(conda run:*)",
       "Bash(python3.8 scripts/evaluate_burst_attack.py \\\\\n  --perf-path models/perf_cartpole_ppo \\\\\n  --switcher-path models/switcher.pt \\\\\n  --dataset data/critical_dataset.npz \\\\\n  --delta-budget-l2 0.2 \\\\\n  --attack-mode fixed \\\\\n  --episodes 20 2>&1)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \\\\\n    --perf-path HalfCheetah/HalfCheetah_PPO.model \\\\\n    --attack-path HalfCheetah/HalfCheetah_Attack_PPO.model \\\\\n    --backup-path HalfCheetah/HalfCheetah_ATLA.model \\\\\n    --gp-switcher-path models/halfcheetah_switcher_gp_s02.pt \\\\\n    --dataset data/halfcheetah_critical_dataset.npz \\\\\n    --sigma 0.2 --delta-budget-l2 0.1 \\\\\n    --episodes 30 --seed 0 \\\\\n    --attack-mode multi \\\\\n    --burst-k 100 --n-bursts 3 --cooldown-k 100 \\\\\n    --K-enter 3 --K-exit 5 --forgive-decay 1 \\\\\n    --attack-norm l2 --attack-eps 0.5 \\\\\n    --output-json results/halfcheetah_3way_multi.json 2>&1)",
+      "Bash(ls -la results/halfcheetah_3way*.json)",
+      "Bash(python3.8 -c \"\nimport json\nd = json.load\\(open\\('results/halfcheetah_new_multi.json'\\)\\)\nprint\\(json.dumps\\(d.get\\('config', {}\\), indent=2\\)\\)\n\")",
+      "Bash(wait)"
     ]
   }
 }

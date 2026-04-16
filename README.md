@@ -42,9 +42,13 @@ scripts/
   train_switcher_gp.py               # Train SwitcherQuadMLP GP switcher
   train_switcher.py                  # Train MC RS switcher
   train_perf.py                      # Train CartPole PPO
+  plot_cert_collapse.py              # poster_figures/cert_collapse.pdf (signed R trace)
+  plot_latency_wall.py               # poster_figures/latency_wall.pdf (GP vs RS timing)
   plot_bar_chart.py                  # poster_figures/bar_chart.pdf
   plot_r_distribution.py             # poster_figures/r_distribution.pdf
   plot_episode_trace.py              # poster_figures/episode_trace.pdf
+  evaluate_cartpole_multi_arb.py     # CartPole multi-burst / arbitrary eval
+  compare_gp_vs_rs_same_model.py     # GP vs RS timing benchmark
 
 data/                        # Datasets (.npz): X, y, state_mean, state_std
 models/                      # Switcher checkpoints (.pt)
@@ -58,19 +62,19 @@ policy_gradients/            # Required for unpickling .model files — do not d
 
 **HalfCheetah** (L2 eps=0.5, 300 total attack steps, 30 episodes):
 
-| Controller | Clean | Single burst | Multi-burst (3×100) |
-|---|---|---|---|
-| Always PPO | 7242 | 4082 | 3168 |
-| Always ATLA | 5646 | 5641 | 5649 |
-| **Continuous GP (ours)** | **7132** | **6687** | **6598** |
+| Controller | Clean | Single burst | Multi-burst (3×100) | Arbitrary (E=300) |
+|---|---|---|---|---|
+| Always PPO | 7245 ± 99 | 4082 ± 1290 | 3168 ± 1661 | 5929 ± 1210 |
+| Always ATLA | 5652 ± 46 | 5641 ± 50 | 5649 ± 52 | 5632 ± 44 |
+| **Continuous GP (ours)** | **7168 ± 125** | **6687 ± 135** | **6598 ± 1196** | **5874 ± 1934** |
 
-**CartPole** (L2 eps=1.0, burst=200, 50 episodes):
+**CartPole** (L2 eps=1.0, 50 episodes):
 
-| Controller | Clean | Attacked |
-|---|---|---|
-| Always PPO | 500 | 107 |
-| Always LQR | 500 | 500 |
-| **GP Switcher (ours)** | **500** | **500** |
+| Controller | Clean | Single (burst=200) | Multi (2×100) | Arbitrary (E=200) |
+|---|---|---|---|---|
+| Always PPO | 500 ± 0 | 107 ± 42 | 450 ± 98 | 500 ± 0 |
+| Always LQR | 500 ± 0 | 500 ± 0 | 500 ± 0 | 500 ± 0 |
+| **GP Switcher (ours)** | **500 ± 0** | **500 ± 0** | **500 ± 0** | **500 ± 0** |
 
 ## Quick start (HalfCheetah)
 
@@ -88,9 +92,10 @@ python3.8 scripts/evaluate_continuous_controller.py --env halfcheetah \
     --attack-norm l2 --attack-eps 0.5
 
 # Regenerate paper figures
+python3.8 scripts/plot_cert_collapse.py --seed 4
+python3.8 scripts/plot_latency_wall.py
 python3.8 scripts/plot_bar_chart.py
 python3.8 scripts/plot_r_distribution.py
-python3.8 scripts/plot_episode_trace.py --seed 4
 ```
 
 See `CLAUDE.md` for full documentation, parameter rationale, and per-environment details.
